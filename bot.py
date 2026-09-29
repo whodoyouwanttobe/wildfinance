@@ -168,10 +168,14 @@ def classify_error(exc: Exception) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def get_buy_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура оплаты: только онлайн-оплата."""
+    """Клавиатура оплаты: подписка и навсегда."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
-            text="💳 Оплатить онлайн (5000 руб.)",
+            text="💳 Подписка на месяц (1490 руб.)",
+            url=PAYMENT_URL,
+        )],
+        [InlineKeyboardButton(
+            text="💳 Навсегда / Lifetime (5000 руб.)",
             url=PAYMENT_URL,
         )]
     ])
