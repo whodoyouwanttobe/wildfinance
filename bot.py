@@ -35,6 +35,8 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
 )
 
 from database import (
@@ -165,8 +167,18 @@ def classify_error(exc: Exception) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# INLINE-КЛАВИАТУРЫ
+# КЛАВИАТУРЫ
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def get_main_keyboard() -> ReplyKeyboardMarkup:
+    """Главное меню с кнопками внизу экрана."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="💳 Оплатить доступ")],
+            [KeyboardButton(text="📄 Помощь")]
+        ],
+        resize_keyboard=True,
+    )
 
 def get_buy_keyboard() -> InlineKeyboardMarkup:
     """Клавиатура оплаты: подписка и навсегда."""
@@ -208,16 +220,18 @@ async def cmd_start(message: Message):
     if is_new:
         logger.info("Новый пользователь: %s (@%s)", user_id, username)
 
-    await message.answer(WELCOME_TEXT, parse_mode="HTML")
+    await message.answer(WELCOME_TEXT, parse_mode="HTML", reply_markup=get_main_keyboard())
 
 
 @dp.message(Command("help"))
+@dp.message(F.text == "📄 Помощь")
 async def cmd_help(message: Message):
     """Обработчик команды /help."""
     await message.answer(HELP_TEXT, parse_mode="HTML")
 
 
 @dp.message(Command("buy"))
+@dp.message(F.text == "💳 Оплатить доступ")
 async def cmd_buy(message: Message):
     """Обработчик команды /buy — показывает варианты оплаты."""
     text = (
