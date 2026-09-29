@@ -1,0 +1,213 @@
+"""
+database.py — Работа с SQLite базой данных users.db.
+
+Таблицы:
+  users:
+    - user_id      INTEGER PRIMARY KEY  (Telegram user ID)
+    - username     TEXT                  (Telegram username)
+    - join_date    TEXT                  (ISO-формат даты регистрации)
+    - access_until TEXT                  (NULL = триал, иначе — дата окончания доступа)
+    - report_count INTEGER DEFAULT 0    (кол-во загруженных отчётов)
+
+  feedback:
+    - id           INTEGER PRIMARY KEY AUTOINCREMENT
+    - user_id      INTEGER              (Telegram user ID)
+    - stars        INTEGER              (1-5)
+    - text         TEXT                  (отзыв пользователя)
+    - created_at   TEXT                  (дата отзыва)
+"""
+
+import sqlite3
+import os
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Если задана переменная DATA_DIR (например, /app/data в Railway),
+# база будет сохранена там. Иначе — в текущей папке скрипта.
+_default_dir = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.getenv("DATA_DIR", _default_dir)
+DB_PATH = os.path.join(DATA_DIR, "users.db")
+
+FREE_TRIAL_DAYS = 7
+
+
+def get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
+    """Создаёт подключение к БД и таблицы, если их нет. Мигрирует старые схемы."""
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id      INTEGER PRIMARY KEY,
+            username     TEXT,
+            join_date    TEXT NOT NULL,
+            access_until TEXT DEFAULT NULL,
+            report_count INTEGER DEFAULT 0
+        )
+    """)
+    # Миграция: добавляем новые столбцы, если таблица уже существовала
+    for alter in (
+        "ALTER TABLE users ADD COLUMN access_until TEXT DEFAULT NULL",
+        "ALTER TABLE users ADD COLUMN report_count INTEGER DEFAULT 0",
+    ):
+        try:
+            conn.execute(alter)
+        except sqlite3.OperationalError:
+            pass  # столбец уже существует
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS feedback (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id    INTEGER NOT NULL,
+            stars      INTEGER NOT NULL,
+            text       TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def add_user(user_id: int, username: str | None = None, db_path: str = DB_PATH) -> bool:
+    """
+    Добавляет пользователя в БД, если его ещё нет.
+    Возвращает True если пользователь новый, False если уже существовал.
+    """
+    conn = get_connection(db_path)
+    try:
+        cursor = conn.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
+        if cursor.fetchone() is not None:
+            return False
+
+        now = datetime.utcnow().isoformat()
+        conn.execute(
+            "INSERT INTO users (user_id, username, join_date, report_count) VALUES (?, ?, ?, 0)",
+            (user_id, username or "", now),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def is_trial_active(user_id: int, db_path: str = DB_PATH) -> bool:
+    """
+    Проверяет, есть ли у пользователя доступ.
+    Приоритет: access_until (оплаченный) → триал (7 дней).
+    """
+    conn = get_connection(db_path)
+    try:
+        cursor = conn.execute(
+            "SELECT join_date, access_until FROM users WHERE user_id = ?",
+            (user_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return False
+
+        join_date_str, access_until_str = row
+
+        # Если есть оплаченный доступ — проверяем его
+        if access_until_str:
+            access_until = datetime.fromisoformat(access_until_str)
+            return datetime.utcnow() < access_until
+
+        # Иначе — стандартный 7-дневный триал
+        join_date = datetime.fromisoformat(join_date_str)
+        return datetime.utcnow() < join_date + timedelta(days=FREE_TRIAL_DAYS)
+    finally:
+        conn.close()
+
+
+def get_user(user_id: int, db_path: str = DB_PATH) -> dict | None:
+    """Возвращает данные пользователя или None."""
+    conn = get_connection(db_path)
+    try:
+        cursor = conn.execute(
+            "SELECT user_id, username, join_date, access_until, report_count "
+            "FROM users WHERE user_id = ?",
+            (user_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            "user_id": row[0],
+            "username": row[1],
+            "join_date": row[2],
+            "access_until": row[3],
+            "report_count": row[4],
+        }
+    finally:
+        conn.close()
+
+
+def grant_access(user_id: int, days: int, db_path: str = DB_PATH) -> bool:
+    """
+    Выдаёт пользователю доступ на N дней от текущего момента.
+    Возвращает True если пользователь найден, False если нет.
+    """
+    conn = get_connection(db_path)
+    try:
+        cursor = conn.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
+        if cursor.fetchone() is None:
+            return False
+
+        until = (datetime.utcnow() + timedelta(days=days)).isoformat()
+        conn.execute(
+            "UPDATE users SET access_until = ? WHERE user_id = ?",
+            (until, user_id),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def increment_report_count(user_id: int, db_path: str = DB_PATH) -> int:
+    """
+    Увеличивает счётчик отчётов пользователя на 1.
+    Возвращает новое значение счётчика.
+    """
+    conn = get_connection(db_path)
+    try:
+        conn.execute(
+            "UPDATE users SET report_count = report_count + 1 WHERE user_id = ?",
+            (user_id,),
+        )
+        conn.commit()
+        cursor = conn.execute(
+            "SELECT report_count FROM users WHERE user_id = ?", (user_id,),
+        )
+        row = cursor.fetchone()
+        return row[0] if row else 0
+    finally:
+        conn.close()
+
+
+def save_feedback(
+    user_id: int, stars: int, text: str = "", db_path: str = DB_PATH
+) -> None:
+    """Сохраняет отзыв пользователя."""
+    conn = get_connection(db_path)
+    try:
+        now = datetime.utcnow().isoformat()
+        conn.execute(
+            "INSERT INTO feedback (user_id, stars, text, created_at) VALUES (?, ?, ?, ?)",
+            (user_id, stars, text, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def has_given_feedback(user_id: int, db_path: str = DB_PATH) -> bool:
+    """Проверяет, оставлял ли пользователь отзыв."""
+    conn = get_connection(db_path)
+    try:
+        cursor = conn.execute(
+            "SELECT 1 FROM feedback WHERE user_id = ?", (user_id,),
+        )
+        return cursor.fetchone() is not None
+    finally:
+        conn.close()
