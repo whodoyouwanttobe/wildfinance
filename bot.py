@@ -57,7 +57,8 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-PAYMENT_URL = os.getenv("PAYMENT_URL", "https://example.com/pay")
+PAYMENT_URL_MONTH = os.getenv("PAYMENT_URL_MONTH", "https://yookassa.ru")
+PAYMENT_URL_FOREVER = os.getenv("PAYMENT_URL_FOREVER", "https://yookassa.ru")
 CARD_DETAILS = os.getenv("CARD_DETAILS", "Сбербанк: 0000 0000 0000 0000 (Имя Ф.)")
 
 if not BOT_TOKEN:
@@ -172,11 +173,11 @@ def get_buy_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
             text="💳 Подписка на месяц (1490 руб.)",
-            url=PAYMENT_URL,
+            url=PAYMENT_URL_MONTH,
         )],
         [InlineKeyboardButton(
             text="💳 Навсегда / Lifetime (5000 руб.)",
-            url=PAYMENT_URL,
+            url=PAYMENT_URL_FOREVER,
         )]
     ])
 
