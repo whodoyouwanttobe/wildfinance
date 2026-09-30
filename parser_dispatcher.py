@@ -28,20 +28,12 @@ OZON_REQUIRED = ("ID начисления", "Группа услуг", "Тип �
 
 
 def _peek_columns(filepath: str, max_rows: int = 5) -> list[str]:
-    """Читает первые строки файла, чтобы посмотреть на заголовки."""
+    """Заголовки таблицы (строку заголовков ищем сами — над ней может быть «шапка»)."""
+    from table_reader import read_table
     ext = os.path.splitext(filepath)[1].lower()
-    if ext == ".csv":
-        for enc in ("utf-8-sig", "cp1251", "utf-8"):
-            try:
-                df = pd.read_csv(filepath, nrows=max_rows, encoding=enc)
-                return list(df.columns)
-            except UnicodeDecodeError:
-                continue
+    if ext not in (".csv", ".xlsx", ".xls"):
         return []
-    if ext in (".xlsx", ".xls"):
-        df = pd.read_excel(filepath, nrows=max_rows)
-        return list(df.columns)
-    return []
+    return list(read_table(filepath).columns)
 
 
 def detect_marketplace(filepath: str) -> str:
@@ -96,3 +88,13 @@ def compute(filepath: str) -> dict:
         return wb_compute(filepath)
     from ozon_parser import compute as ozon_compute
     return ozon_compute(filepath)
+
+
+def analyze_full(filepath: str) -> tuple[str, dict]:
+    """Один проход по файлу: (HTML-отчёт, метрики). Нужен боту для себестоимости."""
+    metrics = compute(filepath)
+    if metrics["marketplace"] == "WB":
+        from wb_parser import analyze as wb_analyze
+        return wb_analyze(filepath, metrics), metrics
+    from ozon_parser import analyze as ozon_analyze
+    return ozon_analyze(filepath, metrics), metrics

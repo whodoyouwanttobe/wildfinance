@@ -24,6 +24,7 @@ import os
 import pandas as pd
 
 from abc_analysis import render_abc
+from table_reader import read_table, to_num
 
 # ─── Маппинг столбцов ───────────────────────────────────────────────────────
 
@@ -50,6 +51,28 @@ COLUMNS_B = {
     "удержания":     "Удержания",
 }
 
+# Дополнительные списания реального отчёта WB (если столбцы есть в файле).
+# Ключ — в какую статью расходов добавляем.
+EXTRA_DEDUCTIONS = {
+    "удержания": (
+        "Корректировка Вознаграждения Вайлдберриз (ВВ)",       # удержание «+», выплата «−»
+        "Разовое изменение срока перечисления денежных средств",  # комиссия «Вывести сейчас»
+    ),
+    "логистика": (
+        "Возмещение издержек по перевозке/по складским операциям с товаром",
+    ),
+}
+COL_ТИП_ДОКУМЕНТА = "Тип документа"
+COL_КОЛ_ВО = "Кол-во"
+# Цена продажи покупателю (база для налога УСН «доходы»), по приоритету
+GROSS_COLUMNS = (
+    "Вайлдберриз реализовал товар (Пр)",
+    "Цена розничная с учётом согласованной скидки",
+    "Цена розничная",
+)
+NAME_COLUMNS = ("Название", "Предмет")
+COL_ВИДЫ = "Виды доставок, штрафов и корректировок ВВ"
+
 
 def detect_column_mapping(df: pd.DataFrame) -> dict:
     """Автоматически определяет формат отчёта по наличию столбцов."""
@@ -64,19 +87,13 @@ def detect_column_mapping(df: pd.DataFrame) -> dict:
 def safe_col(df: pd.DataFrame, col_name: str) -> pd.Series:
     """Безопасно возвращает столбец; если его нет — серию нулей."""
     if col_name in df.columns:
-        return pd.to_numeric(df[col_name], errors="coerce").fillna(0)
-    return pd.Series(0, index=df.index)
+        return to_num(df[col_name])
+    return pd.Series(0.0, index=df.index)
 
 
 def load_report(filepath: str) -> pd.DataFrame:
     """Читает CSV или Excel-файл."""
-    ext = os.path.splitext(filepath)[1].lower()
-    if ext == ".csv":
-        return pd.read_csv(filepath, encoding="utf-8-sig")
-    elif ext in (".xlsx", ".xls"):
-        return pd.read_excel(filepath)
-    else:
-        raise ValueError(f"Неподдерживаемый формат файла: {ext}. Нужен .csv или .xlsx")
+    return read_table(filepath)
 
 
 def fmt(value: float) -> str:
@@ -217,14 +234,30 @@ def compute(filepath: str) -> dict:
     хранение_все  = safe_col(df, col_хранение)
     приёмка_все   = safe_col(df, col_приёмка)
     удержания_все = safe_col(df, col_удержания)
+    for col_name in EXTRA_DEDUCTIONS["удержания"]:
+        удержания_все = удержания_все + safe_col(df, col_name)
+    for col_name in EXTRA_DEDUCTIONS["логистика"]:
+        логистика_все = логистика_все + safe_col(df, col_name)
 
-    # Маска «Продажа»
-    if col_обоснование in df.columns:
-        маска_продажа = df[col_обоснование].astype(str).str.strip().str.lower() == "продажа"
+    # Доход = продажи − возвраты. В реальном отчёте WB это «Тип документа»
+    # (Продажа / Возврат); в упрощённых файлах — «Обоснование для оплаты».
+    обоснование = (
+        df[col_обоснование].astype(str).str.strip().str.lower()
+        if col_обоснование in df.columns else pd.Series("", index=df.index)
+    )
+    if COL_ТИП_ДОКУМЕНТА in df.columns:
+        тип = df[COL_ТИП_ДОКУМЕНТА].astype(str).str.strip().str.lower()
+        маска_продажа = тип == "продажа"
+        маска_возврат = тип == "возврат"
+    elif col_обоснование in df.columns:
+        маска_продажа = обоснование == "продажа"
+        маска_возврат = обоснование == "возврат"
     else:
         маска_продажа = pd.Series(True, index=df.index)
+        маска_возврат = pd.Series(False, index=df.index)
 
-    доход_продажи = доход_все.where(маска_продажа, 0)
+    # Сумма возврата в разных выгрузках бывает и «+», и «−» — вычитаем по модулю
+    доход_продажи = доход_все.where(маска_продажа, 0) - доход_все.where(маска_возврат, 0).abs()
 
     # A) Общая чистая прибыль
     общий_доход     = доход_продажи.sum()
@@ -249,17 +282,35 @@ def compute(filepath: str) -> dict:
     else:
         df["_артикул"] = ""
 
-    # Счётчик поездок: строки с логистикой для данного артикула
+    # Счётчик поездок: строки логистики. В старых отчётах WB обоснование
+    # называется «Логистика», в новых — «Доставка».
     if col_обоснование in df.columns:
-        df["_есть_логистика"] = df[col_обоснование].astype(str).str.strip().str.contains(
-            "логистика", case=False, na=False
-        ).astype(int)
-        df["_есть_продажа"] = (
-            df[col_обоснование].astype(str).str.strip().str.lower() == "продажа"
-        ).astype(int)
+        df["_есть_логистика"] = обоснование.str.contains("логистика|доставка", regex=True, na=False).astype(int)
+        df["_есть_продажа"] = (обоснование == "продажа").astype(int)
+        df["_есть_возврат"] = (обоснование == "возврат").astype(int)
     else:
         df["_есть_логистика"] = 0
         df["_есть_продажа"] = 0
+        df["_есть_возврат"] = 0
+    # Проданные штуки (продажи − возвраты) и выручка по цене для покупателя
+    qty = safe_col(df, COL_КОЛ_ВО) if COL_КОЛ_ВО in df.columns else pd.Series(1.0, index=df.index)
+    qty = qty.where(qty != 0, 1.0)
+    df["_шт"] = qty.where(df["_есть_продажа"] == 1, 0) - qty.where(df["_есть_возврат"] == 1, 0)
+    gross_col = next((c for c in GROSS_COLUMNS if c in df.columns), None)
+    if gross_col:
+        gross = safe_col(df, gross_col)
+        df["_брутто"] = gross.where(маска_продажа & (обоснование == "продажа"), 0) - \
+            gross.where(маска_возврат, 0).abs()
+    else:
+        df["_брутто"] = доход_продажи
+    name_col = next((c for c in NAME_COLUMNS if c in df.columns), None)
+    df["_название"] = df[name_col].fillna("").astype(str).str.strip() if name_col else ""
+
+    # Поездки «туда-обратно» без выкупа (реальный отчёт: «… при отмене»)
+    if COL_ВИДЫ in df.columns:
+        df["_отмена"] = df[COL_ВИДЫ].astype(str).str.lower().str.contains("отмен", na=False).astype(int)
+    else:
+        df["_отмена"] = 0
 
     grouped = df.groupby("_артикул").agg(
         доход=("_доход_продажи", "sum"),
@@ -270,6 +321,11 @@ def compute(filepath: str) -> dict:
         удержания=("_удержания", "sum"),
         поездок=("_есть_логистика", "sum"),
         продаж_колво=("_есть_продажа", "sum"),
+        возвратов=("_есть_возврат", "sum"),
+        отмен=("_отмена", "sum"),
+        шт=("_шт", "sum"),
+        выручка_брутто=("_брутто", "sum"),
+        название=("_название", lambda x: next((v for v in x if v and v != "nan"), "")),
     )
     grouped["чистая_прибыль"] = (
         grouped["доход"]
@@ -293,12 +349,14 @@ def compute(filepath: str) -> dict:
     }
 
 
-def analyze(filepath: str) -> str:
+def analyze(filepath: str, m: dict | None = None) -> str:
     """
     Основная логика анализа.
     Возвращает HTML-отформатированный текстовый отчёт (str).
+    m — уже посчитанные метрики compute(), чтобы не читать файл второй раз.
     """
-    m = compute(filepath)
+    if m is None:
+        m = compute(filepath)
     grouped = m["grouped"]
     общий_доход     = m["доход"]
     общая_логистика = m["логистика"]
@@ -312,7 +370,7 @@ def analyze(filepath: str) -> str:
     lines.append("➖➖➖➖➖➖➖➖➖➖➖➖")
     lines.append("📊 <b>ОБЩИЙ ФИНАНСОВЫЙ ИТОГ</b>")
     lines.append("➖➖➖➖➖➖➖➖➖➖➖➖")
-    lines.append(f"  💰 Доход (продажи):   {fmt(общий_доход)} руб.")
+    lines.append(f"  💰 Доход (продажи − возвраты): {fmt(общий_доход)} руб.")
     lines.append(f"  🚚 Логистика:         {fmt_expense(общая_логистика)} руб.")
     lines.append(f"  🔴 Штрафы:            {fmt_expense(общие_штрафы)} руб.")
     lines.append(f"  📦 Хранение:          {fmt_expense(общее_хранение)} руб.")
@@ -321,7 +379,8 @@ def analyze(filepath: str) -> str:
     lines.append("▫️ ▫️ ▫️ ▫️ ▫️ ▫️ ▫️ ▫️ ▫️ ▫️ ▫️ ▫️")
     
     profit_icon = "✅" if чистая_прибыль >= 0 else "🔻"
-    lines.append(f"  {profit_icon} <b>ЧИСТАЯ ПРИБЫЛЬ:    {fmt(чистая_прибыль)} руб.</b>")
+    lines.append(f"  {profit_icon} <b>К ВЫПЛАТЕ ОТ WB:    {fmt(чистая_прибыль)} руб.</b>")
+    lines.append("  <i>до себестоимости и налогов</i>")
     lines.append("➖➖➖➖➖➖➖➖➖➖➖➖")
 
     lines.append("")
@@ -395,13 +454,8 @@ def analyze(filepath: str) -> str:
     lines.extend(render_abc(grouped["чистая_прибыль"]))
 
     lines.append("")
-    lines.append("➖➖➖➖➖➖➖➖➖➖➖➖")
-    lines.append(
-        "📊 <b>Это анализ по 1 файлу.</b> Хочешь видеть такие отчёты "
-        "по всем 1000 SKU каждую неделю автоматически?\n"
-        "   💎 Подписка — <b>1490 руб/мес</b> → /buy"
-    )
-    lines.append("➖➖➖➖➖➖➖➖➖➖➖➖")
+    lines.append("📊 Присылай отчёт каждую неделю и сравнивай динамику: /compare")
+    # Рекламный футер с тарифами добавляет bot.py — и только тем, кто ещё не оплатил
 
     return "\n".join(lines)
 

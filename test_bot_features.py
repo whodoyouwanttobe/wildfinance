@@ -25,7 +25,8 @@ def db(tmp_path, monkeypatch):
     for name in ("add_user", "is_trial_active", "get_user", "extend_access",
                  "record_payment", "increment_report_count", "has_given_feedback",
                  "save_feedback", "add_pending_payment", "get_pending_payments",
-                 "mark_pending_paid"):
+                 "mark_pending_paid", "set_costs", "get_costs", "delete_cost", "get_tax",
+                 "set_tax", "save_last_report", "get_last_report", "set_user_source"):
         fn = getattr(database, name)
         monkeypatch.setattr(B, name, lambda *a, _fn=fn, **k: _fn(*a, db_path=path, **k))
     return path
@@ -129,7 +130,7 @@ async def test_compare_flow(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_compare_rejects_mixed_marketplaces(db, monkeypatch):
+async def test_compare_mixed_marketplaces_shows_wb_vs_ozon(db, monkeypatch):
     uid = 43
     await B.cmd_compare(_msg(uid, text="/compare"))
     files = iter([os.path.join(HERE, "wb_real_report.xlsx"), os.path.join(HERE, "ozon_real_report.xlsx")])
@@ -143,9 +144,34 @@ async def test_compare_rejects_mixed_marketplaces(db, monkeypatch):
     await B.handle_document(_msg(uid, document=doc))
     m2 = _msg(uid, document=doc)
     await B.handle_document(m2)
-    assert "разных маркетплейсов" in m2.answer.call_args.args[0]
-    assert uid in B._compare_state  # режим не сбрасывается — можно прислать правильный файл
-    B._compare_state.pop(uid, None)
+    out = "\n".join(c.args[0] for c in m2.answer.call_args_list)
+    assert "разных площадок" in out and "WB против OZON" in out
+    assert uid not in B._compare_state
+
+
+@pytest.mark.asyncio
+async def test_wbozon_flow_any_order(db, monkeypatch):
+    uid = 45
+    await B.cmd_wbozon(_msg(uid, text="/wbozon"))
+    files = iter([os.path.join(HERE, "ozon_real_report.xlsx"), os.path.join(HERE, "ozon_real_report.xlsx"),
+                  os.path.join(HERE, "wb_real_report.xlsx")])
+
+    async def fake_download(document, destination):
+        import shutil
+        shutil.copy(next(files), destination)
+
+    monkeypatch.setattr(B.bot, "download", fake_download, raising=False)
+    doc = SimpleNamespace(file_name="x.xlsx", file_size=1000)
+    m1 = _msg(uid, document=doc)
+    await B.handle_document(m1)
+    assert "пришли отчёт <b>WB</b>" in m1.answer.call_args.args[0]
+    m2 = _msg(uid, document=doc)       # Ozon ещё раз — просто заменяем
+    await B.handle_document(m2)
+    assert "WB" in m2.answer.call_args.args[0]
+    m3 = _msg(uid, document=doc)
+    await B.handle_document(m3)
+    assert "WB против OZON" in m3.answer.call_args.args[0]
+    assert uid not in B._compare_state
 
 
 @pytest.mark.asyncio
@@ -345,3 +371,134 @@ def test_ym_quickpay_params(monkeypatch):
     p = ym.quickpay_params("wf:month:1:aa", 1490, "WildFinance — 1 месяц")
     assert p["receiver"] == "4100111" and p["sum"] == "1490.00"
     assert p["quickpay-form"] == "button" and p["label"] == "wf:month:1:aa"
+
+
+# ─── Акция «навсегда» до 11 октября, тариф на 12 месяцев после ─────────────
+
+from datetime import datetime as _dt  # noqa: E402
+
+_BEFORE = _dt(2026, 9, 30, 23, 41, tzinfo=B.MSK)
+_LAST_DAY = _dt(2026, 10, 11, 23, 59, tzinfo=B.MSK)
+_AFTER = _dt(2026, 10, 12, 0, 1, tzinfo=B.MSK)
+
+
+def test_promo_window(monkeypatch):
+    monkeypatch.setattr(B, "FOREVER_PROMO_UNTIL", "2026-10-11")
+    assert B.forever_available(_BEFORE) and B.forever_available(_LAST_DAY)
+    assert not B.forever_available(_AFTER)
+    assert B.promo_days_left(_BEFORE) == 11
+    assert "осталось 11 дней" in B.promo_left_text(_BEFORE)
+    assert "последний день" in B.promo_left_text(_LAST_DAY)
+    assert B.available_plans(_BEFORE) == ["month", "forever"]
+    assert B.available_plans(_AFTER) == ["month", "year"]
+
+
+def test_days_word():
+    assert [B.days_word(n) for n in (1, 2, 5, 11, 21, 22, 25)] == \
+        ["день", "дня", "дней", "дней", "день", "дня", "дней"]
+
+
+def test_tariffs_text_switches_after_promo(monkeypatch):
+    monkeypatch.setattr(B, "FOREVER_PROMO_UNTIL", "2026-10-11")
+    before = B.tariffs_text(_BEFORE)
+    after = B.tariffs_text(_AFTER)
+    assert "Навсегда" in before and str(B.PLANS["forever"]["price_rub"]) in before
+    assert "до 11 октября" in before
+    assert "12 месяцев" in after and "Навсегда" not in after
+
+
+def test_buy_keyboard_after_promo(monkeypatch):
+    monkeypatch.setattr(B, "FOREVER_PROMO_UNTIL", "2026-10-11")
+    monkeypatch.setenv("YOOMONEY_WALLET", "4100111")
+    monkeypatch.setenv("YOOMONEY_TOKEN", "tok")
+    kb_before = B.get_buy_keyboard(_BEFORE)
+    kb_after = B.get_buy_keyboard(_AFTER)
+    assert [r[0].callback_data for r in kb_before.inline_keyboard] == ["ym_month", "ym_forever"]
+    assert "ещё 11 дней" in kb_before.inline_keyboard[1][0].text
+    assert [r[0].callback_data for r in kb_after.inline_keyboard] == ["ym_month", "ym_year"]
+
+
+@pytest.mark.asyncio
+async def test_stale_forever_button_after_promo(db, monkeypatch):
+    monkeypatch.setattr(B, "FOREVER_PROMO_UNTIL", "2026-10-11")
+    monkeypatch.setattr(B, "_now_msk", lambda: _AFTER)
+    monkeypatch.setenv("YOOMONEY_WALLET", "4100111")
+    monkeypatch.setenv("YOOMONEY_TOKEN", "tok")
+    c = _cb(600, "ym_forever")
+    await B.callback_ym_buy(c)
+    assert "акция уже закончилась" in c.message.answer.call_args.args[0]
+    assert database.get_pending_payments(user_id=600, db_path=db) == []
+
+
+# ─── Отчёт: кнопки под отчётом, реклама только для неоплативших ────────────
+
+async def _send_report(uid, monkeypatch):
+    async def fake_download(document, destination):
+        import shutil
+        shutil.copy(os.path.join(HERE, "ozon_real_report.xlsx"), destination)
+    monkeypatch.setattr(B.bot, "download", fake_download, raising=False)
+    monkeypatch.setattr(B, "ADMIN_ID", 0)
+    B._compare_state.pop(uid, None)
+    m = _msg(uid, document=SimpleNamespace(file_name="r.xlsx", file_size=1000))
+    await B.handle_document(m)
+    return [c for c in m.answer.call_args_list]
+
+
+@pytest.mark.asyncio
+async def test_report_trial_user_sees_promo_and_inline_buttons(db, monkeypatch):
+    monkeypatch.setattr(B.asyncio, "sleep", AsyncMock())
+    calls = await _send_report(700, monkeypatch)
+    texts = [c.args[0] for c in calls]
+    assert not any(t == "Что дальше?" for t in texts)
+    report_call = next(c for c in calls if "ОТЧЁТ OZON" in c.args[0] or "/buy" in c.args[0])
+    full = "\n".join(t for t in texts)
+    assert "/buy" in full and "Пробный период" in full
+    last_report = [c for c in calls if c.kwargs.get("reply_markup") is not None][0]
+    kb = last_report.kwargs["reply_markup"].inline_keyboard
+    assert kb[0][0].callback_data == "cost_menu" and kb[1][0].callback_data == "post_review"
+    assert report_call is not None
+
+
+@pytest.mark.asyncio
+async def test_report_paid_user_no_promo(db, monkeypatch):
+    monkeypatch.setattr(B.asyncio, "sleep", AsyncMock())
+    database.add_user(701, "paid", db_path=db)
+    database.extend_access(701, 30, db_path=db)
+    calls = await _send_report(701, monkeypatch)
+    full = "\n".join(c.args[0] for c in calls)
+    assert "ОТЧЁТ OZON" in full
+    assert "/buy" not in full and "Пробный период" not in full
+
+
+@pytest.mark.asyncio
+async def test_drop_only_pressed_button():
+    c = _cb(1, "post_ai")
+    c.message.reply_markup = B.get_post_report_keyboard()
+    await B._drop_pressed_button(c)
+    kb = c.message.edit_reply_markup.call_args.kwargs["reply_markup"]
+    datas = [b.callback_data for row in kb.inline_keyboard for b in row]
+    assert "post_ai" not in datas and "post_review" in datas
+
+
+# ─── Источники трафика ──────────────────────────────────────────────────────
+
+def test_parse_start_source():
+    assert B._parse_start_source("/start wbchat") == "wbchat"
+    assert B._parse_start_source("/start ref_123") == "ref_123"
+    assert B._parse_start_source("/start") == ""
+    assert B._parse_start_source("/start <script>") == ""
+
+
+@pytest.mark.asyncio
+async def test_start_saves_source_and_stats(db, monkeypatch):
+    monkeypatch.setattr(B, "set_user_source", lambda uid, src: database.set_user_source(uid, src, db_path=db))
+    m = _msg(800, text="/start wbchat")
+    await B.cmd_start(m)
+    m2 = _msg(800, text="/start other")  # повторный старт не перезаписывает источник
+    await B.cmd_start(m2)
+    await B.cmd_start(_msg(801, text="/start"))
+    database.record_payment("c1", 800, "month", 149000, db_path=db)
+    stats = {s["source"]: s for s in database.get_source_stats(db_path=db)}
+    assert stats["wbchat"]["users"] == 1 and stats["wbchat"]["payers"] == 1
+    assert stats["wbchat"]["revenue_kop"] == 149000
+    assert stats["(без метки)"]["users"] == 1

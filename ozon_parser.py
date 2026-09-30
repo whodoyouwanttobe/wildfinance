@@ -20,6 +20,7 @@ import os
 import pandas as pd
 
 from abc_analysis import render_abc
+from table_reader import read_table, to_num
 
 
 # ─── Маппинг столбцов (Ozon отчёт по начислениям) ────────────────────────────
@@ -45,10 +46,10 @@ LOGISTICS_TYPES = (
     "обработка отправления", "drop-off", "обратная логистика",
     "последняя миля", "магистральная логистика", "доставка",
 )
-STORAGE_TYPES = ("хранение", "утилизация")
+STORAGE_TYPES = ("хранение", "утилизация", "размещение")
 PENALTY_TYPES = (
     "штраф", "неустойка", "удержание", "потеря", "порча",
-    "подмена", "пересорт", "компенсация",
+    "подмена", "пересорт",
 )
 ACQUIRING_TYPES = ("эквайринг", "комиссия за эквайринг")
 PARTNER_TYPES = (
@@ -84,30 +85,19 @@ def detect_column_mapping(df: pd.DataFrame) -> dict:
 
 def safe_str_col(df: pd.DataFrame, col_name: str) -> pd.Series:
     if col_name and col_name in df.columns:
-        return df[col_name].astype(str).fillna("")
+        return df[col_name].fillna("").astype(str)
     return pd.Series("", index=df.index)
 
 
 def safe_num_col(df: pd.DataFrame, col_name: str) -> pd.Series:
     if col_name and col_name in df.columns:
-        return pd.to_numeric(df[col_name], errors="coerce").fillna(0)
-    return pd.Series(0, index=df.index)
+        return to_num(df[col_name])
+    return pd.Series(0.0, index=df.index)
 
 
 def load_report(filepath: str) -> pd.DataFrame:
-    """Читает CSV или Excel. Ozon выгружается в CSV/XLSX."""
-    ext = os.path.splitext(filepath)[1].lower()
-    if ext == ".csv":
-        for enc in ("utf-8-sig", "cp1251", "utf-8"):
-            try:
-                return pd.read_csv(filepath, encoding=enc)
-            except UnicodeDecodeError:
-                continue
-        raise ValueError("Не удалось прочитать CSV: неизвестная кодировка.")
-    elif ext in (".xlsx", ".xls"):
-        return pd.read_excel(filepath)
-    else:
-        raise ValueError(f"Неподдерживаемый формат файла: {ext}. Нужен .csv или .xlsx")
+    """Читает CSV (в т.ч. с «;») или Excel; сам находит строку заголовков."""
+    return read_table(filepath)
 
 
 def fmt(value: float) -> str:
@@ -124,6 +114,15 @@ def fmt_expense(value: float) -> str:
     return fmt(value)
 
 
+def fmt_signed(value: float) -> str:
+    """Сумма Ozon со знаком: списание «−» жирным, начисление «+»."""
+    if value < -0.005:
+        return bold(fmt(value))
+    if value > 0.005:
+        return f"+{fmt(value)}"
+    return fmt(0.0)
+
+
 def fmt_profit(value: float) -> str:
     if value < 0:
         return bold(fmt(value))
@@ -134,17 +133,25 @@ def categorize(group: str, type_: str) -> str:
     """Возвращает: доход / логистика / хранение / штрафы / эквайринг / партнёры / прочее."""
     g = (group or "").lower().strip()
     t = (type_ or "").lower().strip()
-    if "продажа" in t or "возмещение" in t or g == "продажи":
+    if "вознаграждение" in t or "комиссия за продажу" in t:
+        return "комиссия"
+    if "компенсац" in t or ("возмещение" in t and "возврат" not in t):
+        return "компенсации"  # Ozon возмещает продавцу утерю/порчу — это «+»
+    if any(s in t for s in LOGISTICS_TYPES) and "возврат" in t:
+        return "логистика"
+    if ("возврат" in t or g.startswith("возврат")) and "логист" not in t:
+        return "доход"  # возврат выручки — отрицательная сумма, уменьшает доход
+    if "продажа" in t or "выручка" in t or "возмещение" in t or g == "продажи":
         return "доход"
     if any(s in t for s in PENALTY_TYPES):
         return "штрафы"
     if any(s in t for s in ACQUIRING_TYPES):
         return "эквайринг"
-    if any(s in t for s in PARTNER_TYPES):
+    if any(s in t for s in PARTNER_TYPES) or "продвижение" in g or "партн" in g:
         return "партнёры"
     if any(s in t for s in STORAGE_TYPES):
         return "хранение"
-    if any(s in t for s in LOGISTICS_TYPES):
+    if any(s in t for s in LOGISTICS_TYPES) or "доставка" in g or "логистика" in g:
         return "логистика"
     return "прочее"
 
@@ -161,9 +168,10 @@ def generate_insight_ozon(sku: str, row, total_income: float) -> str:
       4. Услуги партнёров > 15% от выручки
     """
     pokatushki = int(row.get("покатушки", 0))
-    acquiring = float(row.get("эквайринг", 0))
-    partner = float(row.get("партнёры", 0))
-    drop_off = float(row.get("дроп_офф", 0))
+    # В отчёте Ozon расходы со знаком «−» — берём модуль
+    acquiring = abs(float(row.get("эквайринг", 0)))
+    partner = abs(float(row.get("партнёры", 0)))
+    drop_off = abs(float(row.get("дроп_офф", 0)))
     income = float(row.get("доход", 0))
     net = float(row.get("чистая_прибыль", 0))
 
@@ -251,22 +259,45 @@ def _group_ozon(df: pd.DataFrame) -> pd.DataFrame:
         .rename_axis(None, axis=1)
     )
     # Гарантируем, что все категории присутствуют (даже если 0)
-    for cat in ("доход", "логистика", "хранение", "штрафы", "эквайринг", "партнёры", "прочее"):
+    for cat in ("доход", "комиссия", "логистика", "хранение", "штрафы", "эквайринг", "партнёры", "прочее", "компенсации"):
         if cat not in pivot.columns:
             pivot[cat] = 0.0
+
+    # Проданные штуки: строки выручки «+» минус возвраты выручки «−»
+    t = df["_тип"].str.lower()
+    is_income = df["_категория"] == "доход"
+    sale_row = is_income & (df["_сумма"] > 0) & ~t.str.contains("возмещение|компенсац", na=False)
+    return_row = is_income & (df["_сумма"] < 0)
+    qty_col = next((c for c in ("Количество", "Кол-во", "Количество, шт") if c in df.columns), None)
+    qty = to_num(df[qty_col]).abs().where(lambda x: x > 0, 1.0) if qty_col else pd.Series(1.0, index=df.index)
+    df["_шт"] = qty.where(sale_row, 0) - qty.where(return_row, 0)
+    name_col = next((c for c in ("Название товара", "Наименование товара", "Название", "Товар") if c in df.columns), None)
+    df["_название"] = df[name_col].fillna("").astype(str).str.strip() if name_col else ""
+    df["_артикул"] = (
+        df[art_col].fillna("").astype(str).str.strip() if art_col else pd.Series("", index=df.index)
+    )
 
     # Дополнительные агрегаты
     extra = df.groupby("_sku").agg(
         покатушки=("_покатушка", "sum"),
         дроп_офф=("_дроп_офф", "sum"),
         строк=("_сумма", "count"),
+        шт=("_шт", "sum"),
+        название=("_название", lambda x: next((v for v in x if v and v != "nan"), "")),
+        артикул=("_артикул", lambda x: next((v for v in x if v and v != "nan"), "")),
     )
 
-    grouped = pivot.join(extra, how="outer").fillna(0)
-    # Расходы в Ozon-отчёте уже отрицательные.
-    # Чистая прибыль = доход − сумма |расходов|.
-    expense_cols = ["логистика", "хранение", "штрафы", "эквайринг", "партнёры", "прочее"]
-    grouped["чистая_прибыль"] = grouped["доход"] - grouped[expense_cols].abs().sum(axis=1)
+    grouped = pivot.join(extra, how="outer")
+    for c in grouped.columns:
+        if c not in ("название", "артикул"):
+            grouped[c] = grouped[c].fillna(0)
+    grouped[["название", "артикул"]] = grouped[["название", "артикул"]].fillna("")
+    grouped["выручка_брутто"] = grouped["доход"]
+    # Суммы в отчёте Ozon уже со знаком: начисления «+», списания «−».
+    # Чистая прибыль (к перечислению) = сумма всех строк. Возмещения и
+    # компенсации со знаком «+» уменьшают расходы, а не увеличивают их.
+    money_cols = ["доход", "комиссия", "логистика", "хранение", "штрафы", "эквайринг", "партнёры", "прочее", "компенсации"]
+    grouped["чистая_прибыль"] = grouped[money_cols].sum(axis=1)
     return grouped
 
 
@@ -302,14 +333,16 @@ def compute(filepath: str) -> dict:
         "эквайринг": float(grouped["эквайринг"].sum()),
         "партнёры": float(grouped["партнёры"].sum()),
         "прочее": float(grouped["прочее"].sum()),
+        "компенсации": float(grouped["компенсации"].sum()),
+        "комиссия": float(grouped["комиссия"].sum()),
         "чистая_прибыль": float(grouped["чистая_прибыль"].sum()),
         "grouped": grouped,
     }
 
 
-def analyze(filepath: str) -> str:
+def analyze(filepath: str, m: dict | None = None) -> str:
     """HTML-отчёт по Ozon-отчёту (метрики считает compute())."""
-    grouped = compute(filepath)["grouped"]
+    grouped = (m or compute(filepath))["grouped"]
 
     total_income = grouped["доход"].sum()
     total_logistics = grouped["логистика"].sum()
@@ -327,22 +360,29 @@ def analyze(filepath: str) -> str:
     lines.append("➖➖➖➖➖➖➖➖➖➖➖➖")
     lines.append("🏆 <b>ОБЩИЙ ФИНАНСОВЫЙ ИТОГ</b>")
     lines.append("➖➖➖➖➖➖➖➖➖➖➖➖")
-    lines.append(f"💰 Выручка (продажи):      +{fmt(total_income)} руб.")
-    lines.append(f"🚚 Логистика (вся):         {fmt_expense(total_logistics)} руб.")
-    if total_drop_off > 0:
-        lines.append(f"    └ 📦 в т.ч. Drop-off:  {fmt_expense(total_drop_off)} руб.")
-    lines.append(f"📦 Хранение + утилизация:   {fmt_expense(total_storage)} руб.")
-    lines.append(f"🔴 Штрафы и удержания:      {fmt_expense(total_penalties)} руб.")
-    if total_acquiring > 0:
-        lines.append(f"💳 Эквайринг:                {fmt_expense(total_acquiring)} руб.")
-    if total_partner > 0:
-        lines.append(f"📣 Услуги партнёров:         {fmt_expense(total_partner)} руб.")
-    if total_other > 0:
-        lines.append(f"🧮 Прочие удержания:         {fmt_expense(total_other)} руб.")
+    lines.append(f"💰 Выручка (продажи − возвраты): {fmt_signed(total_income)} руб.")
+    total_commission = grouped["комиссия"].sum()
+    if abs(total_commission) > 0.005:
+        lines.append(f"🏷 Вознаграждение Ozon:     {fmt_signed(total_commission)} руб.")
+    lines.append(f"🚚 Логистика (вся):         {fmt_signed(total_logistics)} руб.")
+    if abs(total_drop_off) > 0.005:
+        lines.append(f"    └ 📦 в т.ч. Drop-off:  {fmt_signed(total_drop_off)} руб.")
+    lines.append(f"📦 Хранение + утилизация:   {fmt_signed(total_storage)} руб.")
+    lines.append(f"🔴 Штрафы и удержания:      {fmt_signed(total_penalties)} руб.")
+    if abs(total_acquiring) > 0.005:
+        lines.append(f"💳 Эквайринг:                {fmt_signed(total_acquiring)} руб.")
+    if abs(total_partner) > 0.005:
+        lines.append(f"📣 Услуги партнёров:         {fmt_signed(total_partner)} руб.")
+    if abs(total_other) > 0.005:
+        lines.append(f"🧮 Прочие начисления:        {fmt_signed(total_other)} руб.")
+    total_comp = grouped["компенсации"].sum()
+    if abs(total_comp) > 0.005:
+        lines.append(f"💚 Компенсации от Ozon:       {fmt_signed(total_comp)} руб.")
     lines.append("")
     profit_icon = "✅" if total_profit >= 0 else "🚨"
     lines.append(
-        f"{profit_icon} <b>ЧИСТАЯ ПРИБЫЛЬ: {fmt_profit(total_profit)} руб.</b>"
+        f"{profit_icon} <b>К ВЫПЛАТЕ ОТ OZON: {fmt_profit(total_profit)} руб.</b>\n"
+        "<i>до себестоимости и налогов</i>"
     )
 
     if total_pokatushki >= POKATUSHKI_MIN_TRIPS:
@@ -367,18 +407,16 @@ def _render_sections(grouped, total_income, lines) -> str:
 
     top = grouped.sort_values("чистая_прибыль", ascending=False).head(15)
     for sku, row in top.iterrows():
-        label = f"🔻 {sku}" if row["чистая_прибыль"] < 0 else f"🔹 {sku}"
+        shown = f"{row['артикул']} (SKU {str(sku).split(':', 1)[-1]})" if row.get("артикул") else sku
+        label = f"🔻 {shown}" if row["чистая_прибыль"] < 0 else f"🔹 {shown}"
         lines.append(f"\n  <b>{label}</b>")
-        lines.append(f"    💰 Доход:           +{fmt(row['доход'])} руб.")
-        lines.append(f"    🚚 Логистика:       {fmt_expense(row['логистика'])} руб.")
-        lines.append(f"    📦 Хранение:        {fmt_expense(row['хранение'])} руб.")
-        lines.append(f"    🔴 Штрафы:          {fmt_expense(row['штрафы'])} руб.")
-        if abs(row["эквайринг"]) > 0:
-            lines.append(f"    💳 Эквайринг:       {fmt_expense(row['эквайринг'])} руб.")
-        if abs(row["партнёры"]) > 0:
-            lines.append(f"    📣 Партнёры:        {fmt_expense(row['партнёры'])} руб.")
-        if abs(row["прочее"]) > 0:
-            lines.append(f"    🧮 Прочее:          {fmt_expense(row['прочее'])} руб.")
+        lines.append(f"    💰 Доход:           {fmt_signed(row['доход'])} руб.")
+        for key, label in (("комиссия", "🏷 Комиссия:     "), ("логистика", "🚚 Логистика:    "),
+                           ("хранение", "📦 Хранение:     "), ("штрафы", "🔴 Штрафы:       "),
+                           ("эквайринг", "💳 Эквайринг:    "), ("партнёры", "📣 Партнёры:     "),
+                           ("прочее", "🧮 Прочее:       "), ("компенсации", "💚 Компенсации:  ")):
+            if abs(row[key]) > 0.005 or key in ("логистика", "штрафы"):
+                lines.append(f"    {label}   {fmt_signed(row[key])} руб.")
         ит = "✅" if row["чистая_прибыль"] >= 0 else "🚨"
         if row["чистая_прибыль"] < 0:
             lines.append(
@@ -405,12 +443,13 @@ def _render_sections(grouped, total_income, lines) -> str:
 
         for i, (sku, row) in enumerate(убыточные.iterrows(), 1):
             причины = {
-                "Логистика":   abs(row["логистика"]),
-                "Хранение":    abs(row["хранение"]),
-                "Штрафы":      abs(row["штрафы"]),
-                "Эквайринг":   abs(row["эквайринг"]),
-                "Партнёры":    abs(row["партнёры"]),
-                "Прочее":      abs(row["прочее"]),
+                "Комиссия":    -min(row["комиссия"], 0),
+                "Логистика":   -min(row["логистика"], 0),
+                "Хранение":    -min(row["хранение"], 0),
+                "Штрафы":      -min(row["штрафы"], 0),
+                "Эквайринг":   -min(row["эквайринг"], 0),
+                "Партнёры":    -min(row["партнёры"], 0),
+                "Прочее":      -min(row["прочее"], 0),
             }
             главная_причина = max(причины, key=причины.get)
             главная_сумма = причины[главная_причина]
@@ -429,12 +468,8 @@ def _render_sections(grouped, total_income, lines) -> str:
     lines.extend(render_abc(grouped["чистая_прибыль"]))
 
     lines.append("")
-    lines.append("➖➖➖➖➖➖➖➖➖➖➖➖")
-    lines.append(
-        "📊 <b>Это Ozon-аналитика.</b> Присылай еженедельно — увидишь динамику.\n"
-        "   💎 Подписка — <b>1490 руб/мес</b> → /buy"
-    )
-    lines.append("➖➖➖➖➖➖➖➖➖➖➖➖")
+    lines.append("📊 Присылай отчёт каждую неделю и сравнивай динамику: /compare")
+    # Рекламный футер с тарифами добавляет bot.py — и только тем, кто ещё не оплатил
 
     return "\n".join(lines)
 

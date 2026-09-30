@@ -53,6 +53,7 @@ def get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
     for alter in (
         "ALTER TABLE users ADD COLUMN access_until TEXT DEFAULT NULL",
         "ALTER TABLE users ADD COLUMN report_count INTEGER DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN source TEXT DEFAULT ''",
     ):
         try:
             conn.execute(alter)
@@ -76,6 +77,32 @@ def get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
             amount             INTEGER NOT NULL,
             provider_charge_id TEXT DEFAULT '',
             created_at         TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS costs (
+            user_id     INTEGER NOT NULL,
+            marketplace TEXT NOT NULL,
+            article     TEXT NOT NULL,
+            cost        REAL NOT NULL,
+            updated_at  TEXT NOT NULL,
+            PRIMARY KEY (user_id, marketplace, article)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_settings (
+            user_id  INTEGER PRIMARY KEY,
+            tax_mode TEXT,
+            tax_rate REAL DEFAULT 0
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS last_reports (
+            user_id    INTEGER PRIMARY KEY,
+            marketplace TEXT NOT NULL,
+            file_name  TEXT,
+            snapshot   TEXT NOT NULL,
+            created_at TEXT NOT NULL
         )
     """)
     conn.execute("""
@@ -360,5 +387,151 @@ def mark_pending_paid(label: str, db_path: str = DB_PATH) -> None:
     try:
         conn.execute("UPDATE pending_payments SET paid = 1 WHERE label = ?", (label,))
         conn.commit()
+    finally:
+        conn.close()
+
+
+# ─── Источники трафика (t.me/bot?start=<источник>) ─────────────────────────
+
+def set_user_source(user_id: int, source: str, db_path: str = DB_PATH) -> None:
+    """Запоминает, откуда пришёл пользователь (только если источник ещё не задан)."""
+    conn = get_connection(db_path)
+    try:
+        conn.execute(
+            "UPDATE users SET source = ? WHERE user_id = ? AND (source IS NULL OR source = '')",
+            (source, user_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_source_stats(db_path: str = DB_PATH) -> list[dict]:
+    """По каждому источнику: сколько пришло, сколько прислали отчёт, сколько оплатили и на какую сумму."""
+    conn = get_connection(db_path)
+    try:
+        rows = conn.execute("""
+            SELECT COALESCE(NULLIF(u.source, ''), '(без метки)') AS src,
+                   COUNT(*)                                        AS users,
+                   SUM(CASE WHEN u.report_count > 0 THEN 1 ELSE 0 END) AS active,
+                   COUNT(DISTINCT p.user_id)                       AS payers,
+                   COALESCE(SUM(p.amount), 0)                      AS revenue
+            FROM users u
+            LEFT JOIN payments p ON p.user_id = u.user_id
+            GROUP BY src
+            ORDER BY users DESC
+        """).fetchall()
+        return [
+            {"source": r[0], "users": r[1], "active": r[2], "payers": r[3], "revenue_kop": r[4]}
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+
+# ─── Себестоимость, налоги, последний отчёт ─────────────────────────────────
+
+def set_costs(user_id: int, marketplace: str, costs: dict[str, float], db_path: str = DB_PATH) -> int:
+    """Сохраняет себестоимость (за 1 шт) по артикулам. Возвращает число сохранённых."""
+    if not costs:
+        return 0
+    conn = get_connection(db_path)
+    try:
+        now = datetime.utcnow().isoformat()
+        conn.executemany(
+            "INSERT INTO costs (user_id, marketplace, article, cost, updated_at) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(user_id, marketplace, article) DO UPDATE SET cost = excluded.cost, updated_at = excluded.updated_at",
+            [(user_id, marketplace, a, float(c), now) for a, c in costs.items()],
+        )
+        conn.commit()
+        return len(costs)
+    finally:
+        conn.close()
+
+
+def get_costs(user_id: int, marketplace: str | None = None, db_path: str = DB_PATH) -> dict:
+    """{артикул: цена} для маркетплейса или {маркетплейс: {артикул: цена}} для всех."""
+    conn = get_connection(db_path)
+    try:
+        if marketplace:
+            rows = conn.execute(
+                "SELECT article, cost FROM costs WHERE user_id = ? AND marketplace = ? ORDER BY article",
+                (user_id, marketplace),
+            ).fetchall()
+            return {a: c for a, c in rows}
+        rows = conn.execute(
+            "SELECT marketplace, article, cost FROM costs WHERE user_id = ? ORDER BY marketplace, article",
+            (user_id,),
+        ).fetchall()
+        out: dict = {}
+        for mp, a, c in rows:
+            out.setdefault(mp, {})[a] = c
+        return out
+    finally:
+        conn.close()
+
+
+def delete_cost(user_id: int, marketplace: str, article: str, db_path: str = DB_PATH) -> bool:
+    conn = get_connection(db_path)
+    try:
+        cur = conn.execute(
+            "DELETE FROM costs WHERE user_id = ? AND marketplace = ? AND article = ?",
+            (user_id, marketplace, article),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def get_tax(user_id: int, db_path: str = DB_PATH) -> tuple[str | None, float]:
+    conn = get_connection(db_path)
+    try:
+        row = conn.execute("SELECT tax_mode, tax_rate FROM user_settings WHERE user_id = ?", (user_id,)).fetchone()
+        return (row[0], float(row[1] or 0)) if row else (None, 0.0)
+    finally:
+        conn.close()
+
+
+def set_tax(user_id: int, mode: str, rate: float, db_path: str = DB_PATH) -> None:
+    conn = get_connection(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO user_settings (user_id, tax_mode, tax_rate) VALUES (?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET tax_mode = excluded.tax_mode, tax_rate = excluded.tax_rate",
+            (user_id, mode, rate),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def save_last_report(user_id: int, snapshot: dict, file_name: str = "", db_path: str = DB_PATH) -> None:
+    """Снимок последнего отчёта — чтобы ввод себестоимости работал и после перезапуска бота."""
+    import json
+    conn = get_connection(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO last_reports (user_id, marketplace, file_name, snapshot, created_at) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET marketplace = excluded.marketplace, file_name = excluded.file_name, "
+            "snapshot = excluded.snapshot, created_at = excluded.created_at",
+            (user_id, snapshot.get("marketplace", ""), file_name,
+             json.dumps(snapshot, ensure_ascii=False), datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_last_report(user_id: int, db_path: str = DB_PATH) -> dict | None:
+    import json
+    conn = get_connection(db_path)
+    try:
+        row = conn.execute("SELECT snapshot, file_name FROM last_reports WHERE user_id = ?", (user_id,)).fetchone()
+        if not row:
+            return None
+        snap = json.loads(row[0])
+        snap["file_name"] = row[1] or ""
+        return snap
     finally:
         conn.close()

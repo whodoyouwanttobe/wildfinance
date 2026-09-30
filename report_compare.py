@@ -26,7 +26,7 @@ _TOTALS = [
     ("эквайринг", "💳 Эквайринг", True),
     ("партнёры", "📣 Партнёры", True),
     ("прочее", "🧮 Прочее", True),
-    ("чистая_прибыль", "ЧИСТАЯ ПРИБЫЛЬ", False),
+    ("чистая_прибыль", "К ВЫПЛАТЕ", False),
 ]
 
 
@@ -153,3 +153,135 @@ def compare_plain(old: dict, new: dict) -> str:
     for sku, r in pd.concat([df.head(10), df.tail(10)]).drop_duplicates().iterrows():
         parts.append(f"  {_label(sku)}: {r['было']:.0f} → {r['стало']:.0f} ({r['дельта']:+.0f})")
     return "\n".join(parts)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# WB против OZON: где с рубля выручки остаётся больше
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _mp_breakdown(m: dict) -> dict:
+    """
+    Приводит метрики WB и Ozon к одной схеме (все расходы — положительные числа):
+    выручка (цена для покупателя), к выплате, комиссия, логистика, хранение,
+    штрафы, реклама/прочее.
+    """
+    g = m["grouped"]
+    payout = float(m.get("чистая_прибыль", 0))
+    if m.get("marketplace") == "WB":
+        gross = float(g["выручка_брутто"].sum()) if "выручка_брутто" in g else float(m.get("доход", 0))
+        to_seller = float(m.get("доход", 0))  # «к перечислению» — уже за вычетом комиссии и эквайринга
+        parts = {
+            "комиссия": max(gross - to_seller, 0.0),
+            "логистика": abs(float(m.get("логистика", 0))),
+            "хранение": abs(float(m.get("хранение", 0))) + abs(float(m.get("приёмка", 0))),
+            "штрафы": abs(float(m.get("штрафы", 0))),
+            "реклама и прочее": float(m.get("удержания", 0)),
+        }
+    else:
+        gross = float(m.get("доход", 0))
+        neg = lambda key: -float(m.get(key, 0))  # у Ozon расходы со знаком «−»
+        parts = {
+            "комиссия": neg("комиссия") + neg("эквайринг"),
+            "логистика": neg("логистика"),
+            "хранение": neg("хранение"),
+            "штрафы": neg("штрафы"),
+            "реклама и прочее": neg("партнёры") + neg("прочее"),
+        }
+        return {"gross": gross, "payout": payout, "parts": parts,
+                "comp": float(m.get("компенсации", 0))}
+    return {"gross": gross, "payout": payout, "parts": parts, "comp": 0.0}
+
+
+def _per_unit(m: dict) -> dict[str, dict]:
+    """{артикул: {"units", "payout_per_unit", "keep_pct"}} для товаров с продажами."""
+    out = {}
+    g = m["grouped"]
+    for key, row in g.iterrows():
+        k = str(key).strip()
+        if not k or k.startswith("ID:"):
+            continue
+        art = str(row.get("артикул", "") or "").strip() or k.split(":", 1)[-1]
+        units = float(row.get("шт", 0) or 0)
+        gross = float(row.get("выручка_брутто", 0) or 0)
+        payout = float(row.get("чистая_прибыль", 0) or 0)
+        if units <= 0 or gross <= 0:
+            continue
+        out[art.lower()] = {"article": art, "units": units, "ppu": payout / units,
+                            "keep": payout / gross * 100}
+    return out
+
+
+def compare_marketplaces(a: dict, b: dict) -> str:
+    """HTML-сравнение WB и Ozon (порядок файлов не важен)."""
+    wb, oz = (a, b) if a.get("marketplace") == "WB" else (b, a)
+    if wb.get("marketplace") != "WB" or oz.get("marketplace") != "Ozon":
+        raise ValueError("Для сравнения нужны один отчёт WB и один отчёт Ozon.")
+    W, O = _mp_breakdown(wb), _mp_breakdown(oz)
+
+    def pct(v, gross):
+        if gross <= 0:
+            return "—"
+        val = v / gross * 100
+        return f"{0 if abs(val) < 0.5 else val:.0f}%"
+
+    def row(label, w, o):
+        return f"{label:<16}{w:>9}{o:>9}"
+
+    lines = [
+        "⚖️ <b>WB против OZON</b>",
+        "<i>сколько съедает площадка с каждых 100 ₽ выручки</i>",
+        "",
+        "<pre>",
+        row("", "WB", "Ozon"),
+        row("Выручка, ₽", _fmt(W["gross"]), _fmt(O["gross"])),
+    ]
+    for key in ("комиссия", "логистика", "хранение", "штрафы", "реклама и прочее"):
+        lines.append(row(key.capitalize()[:16], pct(W["parts"][key], W["gross"]), pct(O["parts"][key], O["gross"])))
+    if W["comp"] > 0.5 or O["comp"] > 0.5:
+        def plus(v, gross):
+            return f"+{v / gross * 100:.0f}%" if gross > 0 and v > 0.5 else "0%"
+        lines.append(row("Компенсации", plus(W["comp"], W["gross"]), plus(O["comp"], O["gross"])))
+    keep_w = W["payout"] / W["gross"] * 100 if W["gross"] > 0 else None
+    keep_o = O["payout"] / O["gross"] * 100 if O["gross"] > 0 else None
+    lines += [
+        row("К выплате, ₽", _fmt(W["payout"]), _fmt(O["payout"])),
+        row("Остаётся с 100₽", f"{keep_w:.0f} ₽" if keep_w is not None else "—",
+            f"{keep_o:.0f} ₽" if keep_o is not None else "—"),
+        "</pre>",
+    ]
+
+    if keep_w is not None and keep_o is not None:
+        diff = keep_o - keep_w
+        if abs(diff) < 1:
+            lines.append("⚖️ С рубля выручки площадки оставляют вам примерно одинаково.")
+        else:
+            better, worse = ("Ozon", "WB") if diff > 0 else ("WB", "Ozon")
+            lines.append(f"🏆 <b>На {better} с каждых 100 ₽ выручки остаётся на {abs(diff):.0f} ₽ больше</b>, чем на {worse}.")
+        # Главная статья, где разница больше всего
+        diffs = {k: W["parts"][k] / W["gross"] * 100 - O["parts"][k] / O["gross"] * 100
+                 for k in W["parts"]} if W["gross"] > 0 and O["gross"] > 0 else {}
+        if diffs:
+            k, d = max(diffs.items(), key=lambda kv: abs(kv[1]))
+            if abs(d) >= 2:
+                where = "WB" if d > 0 else "Ozon"
+                lines.append(f"💸 Больше всего разница в статье «{k}»: на {where} она выше на {abs(d):.0f} п.п.")
+
+    # Товары, которые продаются на обеих площадках (совпадает артикул продавца)
+    pw, po = _per_unit(wb), _per_unit(oz)
+    common = sorted(set(pw) & set(po), key=lambda k: -(pw[k]["units"] + po[k]["units"]))
+    if common:
+        lines += ["", "🔁 <b>Одинаковые товары на обеих площадках</b> (к выплате за 1 шт):"]
+        for k in common[:10]:
+            w, o = pw[k], po[k]
+            best = "Ozon" if o["ppu"] > w["ppu"] else "WB"
+            lines.append(
+                f"  {html.escape(w['article'])}: WB {_fmt(w['ppu'])} ₽ · Ozon {_fmt(o['ppu'])} ₽ → "
+                f"выгоднее <b>{best}</b> (+{_fmt(abs(o['ppu'] - w['ppu']))} ₽/шт)"
+            )
+        if len(common) > 10:
+            lines.append(f"  … и ещё {len(common) - 10}")
+    else:
+        lines += ["", "<i>Одинаковых артикулов на обеих площадках не нашёл — сравниваю магазины целиком. "
+                      "Если артикулы продавца на WB и Ozon совпадают, покажу выгоду по каждому товару.</i>"]
+    lines += ["", "<i>Выплата — до себестоимости и налогов. Периоды отчётов лучше брать одинаковые.</i>"]
+    return "\n".join(lines)

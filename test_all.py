@@ -143,9 +143,10 @@ class TestWbParser:
         assert len(result) > 0
 
     def test_total_profit(self, test_csv):
-        """Общая чистая прибыль = 4000 - 100 - 500 - 300 - 0 - 200 = 2900."""
+        """Чистая прибыль = (4000 продаж − 2000 возврат) − 1600 расходов = 400.
+        По правилам WB сумма возврата вычитается из дохода продавца."""
         result = analyze(test_csv)
-        assert "2,400.00" in result
+        assert "К ВЫПЛАТЕ ОТ WB:    400.00" in result
 
     def test_sku1_profit(self, test_csv):
         """sku_1: доход 2000 - логистика 100 = 1900."""
@@ -160,9 +161,9 @@ class TestWbParser:
         assert "1,000.00" in result
 
     def test_sales_income(self, test_csv):
-        """Доход считается только по строкам с 'Продажа': 1000+1000+2000=4000."""
+        """Доход = продажи − возвраты: (1000+1000+2000) − 2000 = 2000."""
         result = analyze(test_csv)
-        assert "4,000.00" in result
+        assert "Доход (продажи − возвраты): 2,000.00" in result
 
     def test_storage_expense(self, test_csv):
         """Хранение = 300."""
@@ -494,8 +495,8 @@ class TestIntegration:
         assert is_trial_active(10001, db_path=test_db) is True
 
         result = analyze(test_csv)
-        assert "ЧИСТАЯ ПРИБЫЛЬ" in result
-        assert "2,400.00" in result
+        assert "К ВЫПЛАТЕ" in result
+        assert "400.00" in result
 
     def test_full_flow_expired_trial(self, test_csv, test_db):
         """Полный цикл: пользователь с истёкшим триалом не может получить отчёт."""
@@ -530,4 +531,4 @@ class TestIntegration:
 
         # Анализ
         result = analyze(test_csv)
-        assert "ЧИСТАЯ ПРИБЫЛЬ" in result
+        assert "К ВЫПЛАТЕ" in result

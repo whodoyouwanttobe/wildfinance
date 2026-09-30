@@ -74,7 +74,7 @@ def _names(df: pd.DataFrame) -> str:
     return text
 
 
-def render_abc(profit: pd.Series) -> list[str]:
+def render_abc(profit: pd.Series, basis: str = "по сумме к выплате") -> list[str]:
     """Рендерит блок ABC-анализа (список HTML-строк). Пусто, если данных мало."""
     df = abc_classify(profit)
     if len(df) < 2:
@@ -83,7 +83,7 @@ def render_abc(profit: pd.Series) -> list[str]:
     lines = [
         "",
         "➖➖➖➖➖➖➖➖➖➖➖➖",
-        "🔤 <b>ABC-АНАЛИЗ (по чистой прибыли)</b>",
+        f"🔤 <b>ABC-АНАЛИЗ ({basis})</b>",
         "➖➖➖➖➖➖➖➖➖➖➖➖",
     ]
 
