@@ -58,7 +58,11 @@ from database import (
     extend_access,
     record_payment,
     get_payments_total,
+    add_pending_payment,
+    get_pending_payments,
+    mark_pending_paid,
 )
+import yoomoney_pay as ym
 from wb_parser import analyze as wb_analyze
 from ozon_parser import analyze as ozon_analyze
 from parser_dispatcher import analyze, detect_marketplace, compute
@@ -259,6 +263,11 @@ def get_buy_keyboard() -> InlineKeyboardMarkup:
     (автовыдача доступа). Иначе — старые ссылки ЮKassa (ручная выдача).
     """
     m, f = PLANS["month"]["price_rub"], PLANS["forever"]["price_rub"]
+    if ym.enabled():
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"💳 1 месяц — {m} руб.", callback_data="ym_month")],
+            [InlineKeyboardButton(text=f"💎 Навсегда — {f} руб.", callback_data="ym_forever")],
+        ])
     if PAYMENT_PROVIDER_TOKEN:
         return InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=f"💳 1 месяц — {m} руб.", callback_data="buy_month")],
@@ -415,7 +424,9 @@ async def cmd_buy(message: Message):
         f"  🔹 <b>Месяц</b> — {PLANS['month']['price_rub']} руб.\n"
         "     30 дней доступа. Без автосписаний — продлеваешь сам.\n\n"
     )
-    if PAYMENT_PROVIDER_TOKEN:
+    if ym.enabled():
+        text += "Оплата картой или ЮMoney, доступ откроется автоматически в течение минуты:"
+    elif PAYMENT_PROVIDER_TOKEN:
         text += "Оплата картой прямо в Telegram, доступ откроется автоматически:"
     else:
         text += (
@@ -506,42 +517,164 @@ async def on_successful_payment(message: Message):
     plan_key = parsed[0] if parsed else "month"
     plan = PLANS[plan_key]
 
-    add_user(user_id, message.from_user.username or "")
-    is_new = record_payment(
+    await _grant_paid_access(
+        user_id=user_id,
+        username=message.from_user.username or "",
+        plan_key=plan_key,
         charge_id=sp.telegram_payment_charge_id,
+        amount_kop=sp.total_amount,
+        provider_id=sp.provider_payment_charge_id or "",
+        provider_name="ЮKassa",
+    )
+
+
+async def _grant_paid_access(
+    user_id: int,
+    username: str,
+    plan_key: str,
+    charge_id: str,
+    amount_kop: int,
+    provider_id: str,
+    provider_name: str,
+) -> bool:
+    """
+    Общая выдача доступа после оплаты (ЮKassa или ЮMoney).
+    Возвращает False, если этот платёж уже был засчитан раньше.
+    """
+    plan = PLANS[plan_key]
+    add_user(user_id, username)
+    is_new = record_payment(
+        charge_id=charge_id,
         user_id=user_id,
         plan=plan_key,
-        amount=sp.total_amount,
-        provider_charge_id=sp.provider_payment_charge_id or "",
+        amount=amount_kop,
+        provider_charge_id=provider_id,
     )
     if not is_new:
-        logger.warning("Повторный successful_payment %s — пропускаю", sp.telegram_payment_charge_id)
-        return
+        logger.warning("Повторное уведомление об оплате %s — пропускаю", charge_id)
+        return False
 
     until = extend_access(user_id, plan["days"])
     until_text = "навсегда" if plan_key == "forever" else f"до {until[:10]}"
-    await message.answer(
-        f"🎉 <b>Оплата прошла!</b>\n\nДоступ открыт {until_text}.\n"
-        "Присылай отчёт — разберу его за секунды.",
-        parse_mode="HTML",
-        reply_markup=get_main_keyboard(),
-    )
-    logger.info("Оплата: user=%s plan=%s amount=%s", user_id, plan_key, sp.total_amount)
+    try:
+        await bot.send_message(
+            user_id,
+            f"🎉 <b>Оплата прошла!</b>\n\nДоступ открыт {until_text}.\n"
+            "Присылай отчёт — разберу его за секунды.",
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard(),
+        )
+    except Exception:
+        logger.exception("Не удалось сообщить пользователю %s об оплате", user_id)
+    logger.info("Оплата (%s): user=%s plan=%s amount=%s", provider_name, user_id, plan_key, amount_kop)
 
     if ADMIN_ID:
         try:
-            uname = message.from_user.username or "—"
             await bot.send_message(
                 ADMIN_ID,
-                f"💰 <b>Новая оплата</b>\n\n"
-                f"@{_html_escape(uname)} (<code>{user_id}</code>)\n"
+                f"💰 <b>Новая оплата ({provider_name})</b>\n\n"
+                f"@{_html_escape(username or '—')} (<code>{user_id}</code>)\n"
                 f"Тариф: {plan['title']}\n"
-                f"Сумма: {sp.total_amount / 100:.0f} руб.\n"
-                f"ЮKassa ID: <code>{_html_escape(sp.provider_payment_charge_id or '—')}</code>",
+                f"Сумма: {amount_kop / 100:.0f} руб.\n"
+                f"ID платежа: <code>{_html_escape(provider_id or charge_id)}</code>",
                 parse_mode="HTML",
             )
         except Exception:
             logger.exception("Не удалось уведомить админа об оплате")
+    return True
+
+
+# ─── Автооплата через кошелёк ЮMoney ────────────────────────────────────────
+
+def _ym_pay_keyboard(url: str, amount_rub: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"💳 Оплатить {amount_rub} руб.", url=url)],
+        [InlineKeyboardButton(text="✅ Я оплатил — проверить", callback_data="ym_check")],
+    ])
+
+
+@dp.callback_query(F.data.in_({"ym_month", "ym_forever"}))
+async def callback_ym_buy(callback: CallbackQuery):
+    """Тариф → уникальная ссылка на оплату ЮMoney с меткой пользователя."""
+    await callback.answer()
+    user_id = callback.from_user.id
+    plan_key = callback.data.removeprefix("ym_")
+    plan = PLANS[plan_key]
+    add_user(user_id, callback.from_user.username or "")
+
+    label = ym.make_label(plan_key, user_id)
+    try:
+        url = await ym.create_payment_url(label, plan["price_rub"], plan["title"])
+    except Exception:
+        logger.exception("ЮMoney: не удалось создать ссылку для user=%s", user_id)
+        await callback.message.answer("😔 Не получилось создать ссылку на оплату. Попробуй через минуту: /buy")
+        return
+    add_pending_payment(label, user_id, plan_key)
+    await callback.message.answer(
+        f"🧾 <b>{plan['title']}</b> — {plan['price_rub']} руб.\n\n"
+        "1️⃣ Нажми «Оплатить» и заплати картой или кошельком ЮMoney.\n"
+        "2️⃣ Доступ откроется автоматически в течение минуты.\n\n"
+        "Если ничего не пришло — нажми «Я оплатил».\n"
+        "<i>Ссылка действует 48 часов.</i>",
+        parse_mode="HTML",
+        reply_markup=_ym_pay_keyboard(url, plan["price_rub"]),
+    )
+
+
+async def _check_yoomoney(user_id: int | None = None) -> int:
+    """Ищет оплаты по ожидающим меткам. Возвращает количество засчитанных платежей."""
+    pending = get_pending_payments(user_id=user_id)
+    if not pending:
+        return 0
+    operations = await ym.fetch_incoming(ym.since_for(pending))
+    prices = {k: v["price_rub"] for k, v in PLANS.items()}
+    granted = 0
+    for f in ym.match_payments(operations, pending, prices):
+        ok = await _grant_paid_access(
+            user_id=f["user_id"],
+            username="",
+            plan_key=f["plan"],
+            charge_id=f"yoomoney:{f['operation_id']}",
+            amount_kop=int(round(f["amount"] * 100)),
+            provider_id=f["operation_id"],
+            provider_name="ЮMoney",
+        )
+        mark_pending_paid(f["label"])
+        granted += int(ok)
+    return granted
+
+
+@dp.callback_query(F.data == "ym_check")
+async def callback_ym_check(callback: CallbackQuery):
+    """Кнопка «Я оплатил» — проверяем сразу, не дожидаясь фоновой проверки."""
+    await callback.answer("Проверяю…")
+    try:
+        granted = await _check_yoomoney(callback.from_user.id)
+    except Exception:
+        logger.exception("ЮMoney: ошибка проверки для user=%s", callback.from_user.id)
+        await callback.message.answer("😔 Не удалось проверить оплату. Попробуй через минуту.")
+        return
+    if granted:
+        return  # сообщение «Оплата прошла» уже отправлено
+    if not get_pending_payments(user_id=callback.from_user.id):
+        await callback.message.answer("✅ Этот платёж уже засчитан. Проверь: «📈 Моя статистика».")
+        return
+    await callback.message.answer(
+        "⏳ Платёж пока не найден. Обычно он появляется в течение 1–2 минут после оплаты — "
+        "бот проверит сам и пришлёт сообщение.\n\n"
+        "Если прошло больше 10 минут — нажми /paysupport и приложи чек."
+    )
+
+
+async def _yoomoney_poller(interval: int = 30):
+    """Фоновая проверка оплат ЮMoney каждые interval секунд."""
+    logger.info("ЮMoney: фоновая проверка оплат включена (каждые %s с)", interval)
+    while True:
+        try:
+            await _check_yoomoney()
+        except Exception as exc:
+            logger.warning("ЮMoney: проверка не удалась: %s", exc)
+        await asyncio.sleep(interval)
 
 
 @dp.message(Command("paysupport"))
@@ -1410,6 +1543,8 @@ def _html_escape(text: str) -> str:
 async def main():
     logger.info("Бот запускается...")
     logger.info("ADMIN_ID: %s", ADMIN_ID)
+    if ym.enabled():
+        asyncio.create_task(_yoomoney_poller())
     await dp.start_polling(bot)
 
 

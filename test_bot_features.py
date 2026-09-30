@@ -24,7 +24,8 @@ def db(tmp_path, monkeypatch):
     path = str(tmp_path / "t.db")
     for name in ("add_user", "is_trial_active", "get_user", "extend_access",
                  "record_payment", "increment_report_count", "has_given_feedback",
-                 "save_feedback"):
+                 "save_feedback", "add_pending_payment", "get_pending_payments",
+                 "mark_pending_paid"):
         fn = getattr(database, name)
         monkeypatch.setattr(B, name, lambda *a, _fn=fn, **k: _fn(*a, db_path=path, **k))
     return path
@@ -212,6 +213,8 @@ async def test_successful_payment_grants_access_once(db, monkeypatch):
     conn.close()
     assert database.is_trial_active(uid, db_path=db) is False
 
+    send = AsyncMock()
+    monkeypatch.setattr(B.bot, "send_message", send, raising=False)
     m = _msg(uid)
     m.successful_payment = SimpleNamespace(
         invoice_payload="month:77", total_amount=149000,
@@ -220,14 +223,16 @@ async def test_successful_payment_grants_access_once(db, monkeypatch):
     await B.on_successful_payment(m)
     assert database.is_trial_active(uid, db_path=db) is True
     first_until = database.get_user(uid, db_path=db)["access_until"]
-    assert "Оплата прошла" in m.answer.call_args.args[0]
+    assert send.call_args.args[0] == uid
+    assert "Оплата прошла" in send.call_args.args[1]
 
     # Повторная доставка того же платежа не продлевает доступ ещё раз
+    send.reset_mock()
     m2 = _msg(uid)
     m2.successful_payment = m.successful_payment
     await B.on_successful_payment(m2)
     assert database.get_user(uid, db_path=db)["access_until"] == first_until
-    m2.answer.assert_not_called()
+    send.assert_not_called()
 
 
 def test_extend_access_adds_to_active_period(tmp_path):
@@ -256,3 +261,87 @@ async def test_stats(db):
     m = _msg(90)
     await B.cmd_stats(m)
     assert "Пробный период до" in m.answer.call_args.args[0]
+
+
+# ─── ЮMoney ─────────────────────────────────────────────────────────────────
+
+import yoomoney_pay as ym  # noqa: E402
+
+
+def test_ym_label_roundtrip():
+    label = ym.make_label("forever", 123)
+    assert len(label) <= 64
+    assert ym.parse_label(label) == ("forever", 123)
+    assert ym.parse_label("чужая метка") is None
+
+
+def test_ym_match_payments():
+    pending = [
+        {"label": "wf:month:1:aa", "user_id": 1, "plan": "month"},
+        {"label": "wf:forever:2:bb", "user_id": 2, "plan": "forever"},
+        {"label": "wf:month:3:cc", "user_id": 3, "plan": "month"},
+    ]
+    ops = [
+        {"operation_id": "op1", "label": "wf:month:1:aa", "status": "success", "direction": "in", "amount": 1445.30},
+        {"operation_id": "op2", "label": "wf:forever:2:bb", "status": "in_progress", "direction": "in", "amount": 4850},
+        {"operation_id": "op3", "label": "wf:month:3:cc", "status": "success", "direction": "in", "amount": 100},
+        {"operation_id": "op4", "label": "other", "status": "success", "direction": "in", "amount": 9999},
+    ]
+    found = ym.match_payments(ops, pending, {"month": 1490, "forever": 5000})
+    assert [f["operation_id"] for f in found] == ["op1"]  # в процессе и недоплата не засчитываются
+
+
+def test_ym_keyboard_when_enabled(monkeypatch):
+    monkeypatch.setenv("YOOMONEY_WALLET", "4100111")
+    monkeypatch.setenv("YOOMONEY_TOKEN", "tok")
+    kb = B.get_buy_keyboard()
+    assert kb.inline_keyboard[0][0].callback_data == "ym_month"
+
+
+@pytest.mark.asyncio
+async def test_ym_full_flow(db, monkeypatch):
+    monkeypatch.setenv("YOOMONEY_WALLET", "4100111")
+    monkeypatch.setenv("YOOMONEY_TOKEN", "tok")
+    monkeypatch.setattr(B, "ADMIN_ID", 0)
+    send = AsyncMock()
+    monkeypatch.setattr(B.bot, "send_message", send, raising=False)
+
+    async def fake_url(label, amount, title, payment_type="AC"):
+        return "https://yoomoney.ru/transfer/quickpay?requestId=x"
+    monkeypatch.setattr(ym, "create_payment_url", fake_url)
+
+    uid = 555
+    c = _cb(uid, "ym_forever")
+    await B.callback_ym_buy(c)
+    pending = database.get_pending_payments(user_id=uid, db_path=db)
+    assert len(pending) == 1 and pending[0]["plan"] == "forever"
+    label = pending[0]["label"]
+    kb = c.message.answer.call_args.kwargs["reply_markup"]
+    assert kb.inline_keyboard[0][0].url.startswith("https://yoomoney.ru/")
+
+    # Пока платежа нет — «не найден»
+    async def no_ops(since, records=100):
+        return []
+    monkeypatch.setattr(ym, "fetch_incoming", no_ops)
+    c2 = _cb(uid, "ym_check")
+    await B.callback_ym_check(c2)
+    assert "пока не найден" in c2.message.answer.call_args.args[0]
+
+    # Платёж пришёл — доступ навсегда
+    async def ops(since, records=100):
+        return [{"operation_id": "777", "label": label, "status": "success", "direction": "in", "amount": 4850.0}]
+    monkeypatch.setattr(ym, "fetch_incoming", ops)
+    assert await B._check_yoomoney() == 1
+    assert database.is_trial_active(uid, db_path=db)
+    assert "навсегда" in send.call_args.args[1]
+    assert database.get_pending_payments(user_id=uid, db_path=db) == []
+
+    # Повторная проверка не засчитывает второй раз
+    assert await B._check_yoomoney() == 0
+
+
+def test_ym_quickpay_params(monkeypatch):
+    monkeypatch.setenv("YOOMONEY_WALLET", "4100111")
+    p = ym.quickpay_params("wf:month:1:aa", 1490, "WildFinance — 1 месяц")
+    assert p["receiver"] == "4100111" and p["sum"] == "1490.00"
+    assert p["quickpay-form"] == "button" and p["label"] == "wf:month:1:aa"

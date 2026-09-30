@@ -78,6 +78,15 @@ def get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
             created_at         TEXT NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pending_payments (
+            label      TEXT PRIMARY KEY,
+            user_id    INTEGER NOT NULL,
+            plan       TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            paid       INTEGER DEFAULT 0
+        )
+    """)
     conn.commit()
     return conn
 
@@ -309,5 +318,47 @@ def get_payments_total(db_path: str = DB_PATH) -> tuple[int, int]:
     try:
         row = conn.execute("SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM payments").fetchone()
         return int(row[0]), int(row[1])
+    finally:
+        conn.close()
+
+
+# ─── Ожидающие оплаты ЮMoney ────────────────────────────────────────────────
+
+def add_pending_payment(label: str, user_id: int, plan: str, db_path: str = DB_PATH) -> None:
+    conn = get_connection(db_path)
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO pending_payments (label, user_id, plan, created_at, paid) "
+            "VALUES (?, ?, ?, ?, 0)",
+            (label, user_id, plan, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_pending_payments(
+    user_id: int | None = None, max_age_hours: int = 48, db_path: str = DB_PATH,
+) -> list[dict]:
+    """Неоплаченные счета не старше max_age_hours (опционально — одного пользователя)."""
+    conn = get_connection(db_path)
+    try:
+        since = (datetime.utcnow() - timedelta(hours=max_age_hours)).isoformat()
+        sql = "SELECT label, user_id, plan, created_at FROM pending_payments WHERE paid = 0 AND created_at >= ?"
+        args: list = [since]
+        if user_id is not None:
+            sql += " AND user_id = ?"
+            args.append(user_id)
+        rows = conn.execute(sql, args).fetchall()
+        return [{"label": r[0], "user_id": r[1], "plan": r[2], "created_at": r[3]} for r in rows]
+    finally:
+        conn.close()
+
+
+def mark_pending_paid(label: str, db_path: str = DB_PATH) -> None:
+    conn = get_connection(db_path)
+    try:
+        conn.execute("UPDATE pending_payments SET paid = 1 WHERE label = ?", (label,))
+        conn.commit()
     finally:
         conn.close()
