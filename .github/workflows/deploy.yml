@@ -45,15 +45,33 @@ jobs:
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           echo "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          # keepalive: сервер рвёт «молчащие» SSH-соединения
+          echo "SSH_OPTS=-i $HOME/.ssh/deploy_key -p $SSH_PORT -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ConnectTimeout=20" >> "$GITHUB_ENV"
 
       - name: Загрузка кода на сервер
         run: |
           rsync -az --delete \
             --exclude '.git/' --exclude '.github/' \
             --exclude '.env' --exclude 'data/' --exclude 'users.db' \
+            --exclude 'deploy.log' --exclude 'deploy.status' \
             --exclude '__pycache__/' --exclude '.pytest_cache/' \
-            -e "ssh -i ~/.ssh/deploy_key -p $SSH_PORT" \
+            -e "ssh $SSH_OPTS" \
             ./ "$SSH_USER@$SSH_HOST:$APP_DIR/"
 
       - name: Сборка и перезапуск
-        run: ssh -i ~/.ssh/deploy_key -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "bash $APP_DIR/deploy/deploy.sh"
+        run: |
+          remote() { ssh $SSH_OPTS "$SSH_USER@$SSH_HOST" "$@"; }
+          # Сборка идёт на сервере в фоне — обрыв SSH её не прервёт
+          remote "bash $APP_DIR/deploy/run_detached.sh"
+          for i in $(seq 1 90); do
+            sleep 10
+            STATUS=$(remote "cat $APP_DIR/deploy.status 2>/dev/null" || true)
+            if [ -n "$STATUS" ]; then
+              remote "cat $APP_DIR/deploy.log" || true
+              exit "$STATUS"
+            fi
+            echo "⏳ деплой идёт... $((i * 10)) с"
+          done
+          echo "❌ Деплой не закончился за 15 минут. Последние строки лога:"
+          remote "tail -50 $APP_DIR/deploy.log" || true
+          exit 1

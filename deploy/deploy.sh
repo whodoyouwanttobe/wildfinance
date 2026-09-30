@@ -15,6 +15,12 @@ if [ ! -f .env ]; then
 fi
 mkdir -p data
 
+if ! docker compose version >/dev/null 2>&1; then
+  echo "❌ На сервере нет плагина docker compose. Установи (от root):" >&2
+  echo "   apt-get install -y docker-compose-v2 docker-buildx" >&2
+  exit 1
+fi
+
 # Запоминаем текущую рабочую версию для отката
 HAS_PREVIOUS=0
 if docker image inspect "$IMAGE:latest" >/dev/null 2>&1; then
@@ -23,7 +29,7 @@ if docker image inspect "$IMAGE:latest" >/dev/null 2>&1; then
 fi
 
 echo "🔨 Сборка образа..."
-docker compose build --pull
+docker compose build
 
 echo "🚀 Перезапуск бота..."
 docker compose up -d --remove-orphans
