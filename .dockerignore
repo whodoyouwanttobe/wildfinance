@@ -1,0 +1,15 @@
+# Секреты и данные — никогда не кладём в образ
+.env
+.env.*
+!.env.example
+users.db
+data/
+
+# Мусор
+.git
+.github
+__pycache__/
+*.pyc
+.pytest_cache/
+deploy.zip
+*.log

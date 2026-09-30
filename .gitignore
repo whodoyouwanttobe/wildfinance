@@ -5,3 +5,6 @@ users.db
 *.xlsx
 *.csv
 .pytest_cache/
+# демо-файлы для кнопки «Получить пример отчёта» нужны в репозитории
+!wb_real_report.xlsx
+!ozon_real_report.xlsx

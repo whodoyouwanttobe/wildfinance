@@ -9,6 +9,10 @@ database.py — Работа с SQLite базой данных users.db.
     - access_until TEXT                  (NULL = триал, иначе — дата окончания доступа)
     - report_count INTEGER DEFAULT 0    (кол-во загруженных отчётов)
 
+  payments:
+    - charge_id    TEXT PRIMARY KEY     (telegram_payment_charge_id — защита от двойного зачисления)
+    - user_id, plan, amount (коп.), provider_charge_id, created_at
+
   feedback:
     - id           INTEGER PRIMARY KEY AUTOINCREMENT
     - user_id      INTEGER              (Telegram user ID)
@@ -62,6 +66,16 @@ def get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
             stars      INTEGER NOT NULL,
             text       TEXT DEFAULT '',
             created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS payments (
+            charge_id          TEXT PRIMARY KEY,
+            user_id            INTEGER NOT NULL,
+            plan               TEXT NOT NULL,
+            amount             INTEGER NOT NULL,
+            provider_charge_id TEXT DEFAULT '',
+            created_at         TEXT NOT NULL
         )
     """)
     conn.commit()
@@ -142,6 +156,28 @@ def get_user(user_id: int, db_path: str = DB_PATH) -> dict | None:
         conn.close()
 
 
+def get_all_users_stats(db_path: str = DB_PATH) -> list[dict]:
+    """Возвращает список всех пользователей для админки."""
+    conn = get_connection(db_path)
+    try:
+        cursor = conn.execute(
+            "SELECT user_id, username, join_date, access_until, report_count "
+            "FROM users ORDER BY join_date DESC"
+        )
+        users = []
+        for row in cursor.fetchall():
+            users.append({
+                "user_id": row[0],
+                "username": row[1],
+                "join_date": row[2],
+                "access_until": row[3],
+                "report_count": row[4],
+            })
+        return users
+    finally:
+        conn.close()
+
+
 def grant_access(user_id: int, days: int, db_path: str = DB_PATH) -> bool:
     """
     Выдаёт пользователю доступ на N дней от текущего момента.
@@ -209,5 +245,69 @@ def has_given_feedback(user_id: int, db_path: str = DB_PATH) -> bool:
             "SELECT 1 FROM feedback WHERE user_id = ?", (user_id,),
         )
         return cursor.fetchone() is not None
+    finally:
+        conn.close()
+
+
+def extend_access(user_id: int, days: int, db_path: str = DB_PATH) -> str | None:
+    """
+    Продлевает доступ на N дней. Если оплаченный доступ ещё активен — дни
+    прибавляются к его концу (оплата заранее не «сгорает»), иначе — от текущего момента.
+    Возвращает новую дату окончания (ISO) или None, если пользователя нет.
+    """
+    conn = get_connection(db_path)
+    try:
+        row = conn.execute(
+            "SELECT access_until FROM users WHERE user_id = ?", (user_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        now = datetime.utcnow()
+        start = now
+        if row[0]:
+            current = datetime.fromisoformat(row[0])
+            if current > now:
+                start = current
+        until = (start + timedelta(days=days)).isoformat()
+        conn.execute("UPDATE users SET access_until = ? WHERE user_id = ?", (until, user_id))
+        conn.commit()
+        return until
+    finally:
+        conn.close()
+
+
+def record_payment(
+    charge_id: str,
+    user_id: int,
+    plan: str,
+    amount: int,
+    provider_charge_id: str = "",
+    db_path: str = DB_PATH,
+) -> bool:
+    """
+    Сохраняет платёж. Возвращает False, если платёж с таким charge_id
+    уже был обработан (повторная доставка апдейта) — тогда доступ не продлеваем.
+    """
+    conn = get_connection(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO payments (charge_id, user_id, plan, amount, provider_charge_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (charge_id, user_id, plan, amount, provider_charge_id, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        conn.close()
+
+
+def get_payments_total(db_path: str = DB_PATH) -> tuple[int, int]:
+    """(количество платежей, сумма в копейках) — для админки."""
+    conn = get_connection(db_path)
+    try:
+        row = conn.execute("SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM payments").fetchone()
+        return int(row[0]), int(row[1])
     finally:
         conn.close()

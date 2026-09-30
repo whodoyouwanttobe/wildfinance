@@ -1,0 +1,59 @@
+name: Test & Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:        # кнопка «Run workflow» для ручного деплоя
+
+# Два деплоя одновременно не пойдут — второй подождёт первый
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Тесты
+        run: python -m pytest -q
+        env:
+          BOT_TOKEN: "123456:TEST-TOKEN-FOR-CI"   # фейковый, настоящий токен в CI не нужен
+
+  deploy:
+    needs: test                     # тесты упали → деплоя не будет
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      SSH_PORT: ${{ secrets.SSH_PORT || '22' }}
+      APP_DIR: /opt/wildfinance
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Настройка SSH
+        run: |
+          install -m 700 -d ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          echo "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+
+      - name: Загрузка кода на сервер
+        run: |
+          rsync -az --delete \
+            --exclude '.git/' --exclude '.github/' \
+            --exclude '.env' --exclude 'data/' --exclude 'users.db' \
+            --exclude '__pycache__/' --exclude '.pytest_cache/' \
+            -e "ssh -i ~/.ssh/deploy_key -p $SSH_PORT" \
+            ./ "$SSH_USER@$SSH_HOST:$APP_DIR/"
+
+      - name: Сборка и перезапуск
+        run: ssh -i ~/.ssh/deploy_key -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "bash $APP_DIR/deploy/deploy.sh"

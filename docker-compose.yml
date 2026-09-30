@@ -1,0 +1,16 @@
+services:
+  bot:
+    build: .
+    image: wildfinance-bot:latest
+    container_name: wildfinance-bot
+    restart: unless-stopped          # поднимется сам после падения и перезагрузки сервера
+    env_file: .env                   # секреты лежат только на сервере
+    environment:
+      DATA_DIR: /app/data
+    volumes:
+      - ./data:/app/data             # users.db хранится на диске сервера, не в контейнере
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"              # логи не забьют диск
+        max-file: "3"
