@@ -54,6 +54,9 @@ def get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
         "ALTER TABLE users ADD COLUMN access_until TEXT DEFAULT NULL",
         "ALTER TABLE users ADD COLUMN report_count INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN source TEXT DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN last_seen TEXT DEFAULT NULL",
+        "ALTER TABLE users ADD COLUMN visits INTEGER DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN actions INTEGER DEFAULT 0",
     ):
         try:
             conn.execute(alter)
@@ -690,7 +693,8 @@ def get_crm_rows(db_path: str | None = None) -> list[dict]:
     conn = get_connection(db_path or DB_PATH)
     try:
         users = conn.execute(
-            "SELECT user_id, username, source, join_date, report_count, access_until FROM users"
+            "SELECT user_id, username, source, join_date, report_count, access_until, "
+            "last_seen, visits, actions FROM users"
         ).fetchall()
         events: dict[int, dict] = {}
         for uid, ev, cnt, first, last in conn.execute(
@@ -698,6 +702,10 @@ def get_crm_rows(db_path: str | None = None) -> list[dict]:
             "FROM user_events GROUP BY user_id, event"
         ):
             events.setdefault(uid, {})[ev] = {"count": cnt, "first": first, "last": last}
+        last_rep = {
+            uid: (mp, created)
+            for uid, mp, created in conn.execute("SELECT user_id, marketplace, created_at FROM last_reports")
+        }
         paid = {
             uid: (cnt, total)
             for uid, cnt, total in conn.execute(
@@ -705,7 +713,7 @@ def get_crm_rows(db_path: str | None = None) -> list[dict]:
             )
         }
         rows = []
-        for uid, username, source, join_date, reports, access_until in users:
+        for uid, username, source, join_date, reports, access_until, last_seen, visits, actions in users:
             cnt, total = paid.get(uid, (0, 0))
             rows.append({
                 "user_id": uid,
@@ -717,7 +725,42 @@ def get_crm_rows(db_path: str | None = None) -> list[dict]:
                 "payments": cnt,
                 "paid_rub": round((total or 0) / 100),
                 "events": events.get(uid, {}),
+                "last_report_mp": last_rep.get(uid, (None, None))[0],
+                "last_report_at": last_rep.get(uid, (None, None))[1],
+                "last_seen": last_seen,
+                "visits": visits or 0,
+                "actions": actions or 0,
             })
         return rows
+    finally:
+        conn.close()
+
+
+# ─── Активность: когда заходил последний раз и как часто ─────────────────────
+
+VISIT_GAP_MINUTES = 30   # перерыв дольше этого — новый «заход»
+
+
+def touch_user(user_id: int, username: str | None = None, db_path: str | None = None,
+               now: datetime | None = None) -> None:
+    """Отмечает действие пользователя: last_seen, число действий и заходов (сессий)."""
+    now = now or datetime.utcnow()
+    conn = get_connection(db_path or DB_PATH)
+    try:
+        row = conn.execute("SELECT last_seen FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        if row is None:
+            return  # пользователя ещё нет — его создаст /start
+        new_visit = True
+        if row[0]:
+            try:
+                new_visit = now - datetime.fromisoformat(row[0]) > timedelta(minutes=VISIT_GAP_MINUTES)
+            except ValueError:
+                pass
+        conn.execute(
+            "UPDATE users SET last_seen = ?, actions = COALESCE(actions, 0) + 1, "
+            "visits = COALESCE(visits, 0) + ?, username = COALESCE(?, username) WHERE user_id = ?",
+            (now.isoformat(timespec="seconds"), int(new_visit), username or None, user_id),
+        )
+        conn.commit()
     finally:
         conn.close()

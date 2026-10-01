@@ -22,6 +22,7 @@ bot.py — Асинхронный Telegram-бот на aiogram 3.x.
   python bot.py
 """
 
+import hashlib
 import os
 import re
 import json
@@ -79,6 +80,8 @@ from database import (
     get_pending_receipts,
     delete_user_data,
     log_event,
+    touch_user,
+    get_crm_rows,
 )
 import yoomoney_pay as ym
 import legal
@@ -295,6 +298,23 @@ if not BOT_TOKEN:
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+
+async def _activity_middleware(handler, event, data):
+    """После любого сообщения или кнопки отмечаем активность: когда заходил и как часто."""
+    try:
+        return await handler(event, data)
+    finally:
+        user = getattr(event, "from_user", None)
+        if user is not None:
+            try:
+                await asyncio.to_thread(touch_user, user.id, user.username)
+            except Exception:
+                logger.exception("Не удалось отметить активность %s", getattr(user, "id", "?"))
+
+
+dp.message.outer_middleware(_activity_middleware)
+dp.callback_query.outer_middleware(_activity_middleware)
 
 # ─── Тексты сообщений ─────────────────────────────────────────────────────────
 
@@ -1162,6 +1182,29 @@ async def cmd_demo(message: Message):
 _demo_cache: dict[str, str] = {}
 _demo_ai_cache: dict[str, str] = {}
 
+_demo_hashes: dict[str, str] = {}
+
+
+def _file_sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(65536), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _demo_marketplace_of(path: str) -> str | None:
+    """'WB' / 'Ozon', если файл — один из наших примеров (сравнение по содержимому)."""
+    if not _demo_hashes:
+        for mp, demo_path in DEMO_FILES.items():
+            if os.path.exists(demo_path):
+                _demo_hashes[_file_sha256(demo_path)] = mp
+    try:
+        return _demo_hashes.get(_file_sha256(path))
+    except OSError:
+        return None
+
+
 DEMO_HOW_TO = {
     "WB": "Личный кабинет WB → Финансы → Детализация",
     "Ozon": "Личный кабинет Ozon → Финансы → Детализация начислений",
@@ -1391,42 +1434,112 @@ async def cmd_sources(message: Message):
 async def cmd_users(message: Message):
     """
     Админ-команда: /users
-    Показывает статистику пользователей.
+    Пользователи, отсортированные по последней активности: смотрел ли пример,
+    когда заходил последний раз, сколько раз заходил, отчёты, оплаты.
     Работает только для ADMIN_ID.
     """
     if message.from_user.id != ADMIN_ID:
         await message.answer("⛔ У вас нет доступа к этой команде.")
         return
 
-    users = get_all_users_stats()
+    users = get_crm_rows()
     if not users:
         await message.answer("В базе пока нет пользователей.")
         return
 
     pay_count, pay_sum = get_payments_total()
+    seen_demo = sum(1 for u in users if "demo" in u["events"])
+    by_mp: dict[str, int] = {}
+    for u in users:
+        for mp, cnt in _reports_by_mp(u).items():
+            by_mp[mp] = by_mp.get(mp, 0) + cnt
+    mp_text = " · ".join(f"{mp}: {cnt}" for mp, cnt in sorted(by_mp.items())) or "—"
     text = (
         f"📊 <b>Пользователи ({len(users)} чел.)</b>\n"
+        f"👀 Смотрели пример: {seen_demo} · 📁 прислали отчёт: "
+        f"{sum(1 for u in users if u['reports'])}\n"
+        f"📂 Отчёты по площадкам: {mp_text}\n"
         f"💰 Автооплат: {pay_count} на {pay_sum / 100:,.0f} руб.\n\n"
     )
-    for u in users:
-        uname = f"@{_html_escape(u['username'])}" if u['username'] else "без_юзернейма"
-        text += f"👤 <code>{u['user_id']}</code> | {uname}\n"
-        text += f"   📅 Рег: {u['join_date'][:10]}\n"
-        text += f"   📁 Отчётов: {u['report_count']}\n"
-        
-        if u['access_until']:
-            text += f"   💎 До: {u['access_until'][:10]}\n"
-        else:
-            text += f"   🆓 Триал\n"
-        text += "\n"
+    users.sort(key=lambda u: (bool(u.get("last_seen")), u.get("last_seen") or u.get("join_date") or ""), reverse=True)
+    blocks = [_user_card(u) for u in users]
+    for chunk in split_text(text + "\n\n".join(blocks), max_len=4000):
+        await message.answer(chunk, parse_mode="HTML")
 
-    # Если текст слишком длинный, разобьем его
-    if len(text) <= 4000:
-        await message.answer(text, parse_mode="HTML")
+
+def _msk(ts: str | None) -> str:
+    """ISO-время UTC из базы → «01.10 20:15» по Москве."""
+    if not ts:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", ""))
+    except ValueError:
+        return ts[:16]
+    return (dt.replace(tzinfo=timezone.utc).astimezone(MSK)).strftime("%d.%m %H:%M")
+
+
+def _ago(ts: str | None, now: datetime | None = None) -> str:
+    if not ts:
+        return ""
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "")).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return ""
+    minutes = int(((now or datetime.now(timezone.utc)) - dt).total_seconds() // 60)
+    if minutes < 60:
+        return f"{max(minutes, 0)} мин назад"
+    if minutes < 48 * 60:
+        return f"{minutes // 60} ч назад"
+    return f"{minutes // 1440} дн назад"
+
+
+def _reports_by_mp(u: dict) -> dict[str, int]:
+    """{'WB': 2, 'Ozon': 1} по событиям report:<площадка>; старые отчёты — «без отметки»."""
+    counts = {
+        ev.split(":", 1)[1]: info["count"]
+        for ev, info in u.get("events", {}).items() if ev.startswith("report:")
+    }
+    rest = (u.get("reports") or 0) - sum(counts.values())
+    if rest > 0:
+        counts["до учёта"] = rest
+    return counts
+
+
+def _reports_line(u: dict) -> str:
+    total = u.get("reports") or 0
+    if not total:
+        return "0"
+    parts = ", ".join(f"{mp} — {cnt}" for mp, cnt in sorted(_reports_by_mp(u).items()))
+    line = f"{total} ({parts})"
+    if u.get("last_report_mp"):
+        line += f" · последний {u['last_report_mp']} {_msk(u.get('last_report_at'))}"
+    return line
+
+
+def _user_card(u: dict) -> str:
+    uname = f"@{_html_escape(u['username'])}" if u["username"] else "без_юзернейма"
+    ev = u.get("events", {})
+    lines = [f"👤 <code>{u['user_id']}</code> | {uname}"
+             + (f" · метка <code>{_html_escape(u['source'])}</code>" if u.get("source") else "")]
+    lines.append(f"   📅 Рег: {_msk(u.get('join_date'))}")
+    if u.get("last_seen"):
+        lines.append(f"   🕐 Был: {_msk(u['last_seen'])} ({_ago(u['last_seen'])})")
+    lines.append(f"   🔁 Заходов: {u.get('visits', 0)} · действий: {u.get('actions', 0)}")
+    demo = ev.get("demo")
+    if demo:
+        lines.append(f"   👀 Пример: да, {demo['count']} раз(а), последний {_msk(demo['last'])}")
     else:
-        chunks = split_text(text, max_len=4000)
-        for chunk in chunks:
-            await message.answer(chunk, parse_mode="HTML")
+        lines.append("   👀 Пример: не открывал")
+    lines.append(f"   📁 Отчётов: {_reports_line(u)}")
+    if ev.get("buy_open") or ev.get("buy_click"):
+        lines.append("   💳 Смотрел тарифы" + (" и жал «Оплатить»" if ev.get("buy_click") else ""))
+    if u.get("payments"):
+        lines.append(f"   💰 Оплатил: {u['paid_rub']} ₽ ({u['payments']} платёж)")
+    if u.get("access_until"):
+        lines.append(f"   💎 Доступ до: {u['access_until'][:10]}")
+    else:
+        lines.append("   🆓 Триал")
+    return "\n".join(lines)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1516,6 +1629,30 @@ async def handle_document(message: Message):
         await bot.download(message.document, destination=tmp_path)
         logger.info("Файл скачан: %s -> %s (%.2f МБ)", file_name, tmp_path, file_size_mb)
 
+        # Прислали обратно наш же файл-пример — не считаем его отчётом пользователя
+        demo_mp = _demo_marketplace_of(tmp_path)
+        if demo_mp:
+            try:
+                await processing_msg.delete()
+            except Exception:
+                pass
+            _event(user_id, "demo_reupload")
+            logger.info("Пользователь %s прислал файл-пример %s — не считаю отчётом", user_id, demo_mp)
+            await message.answer(
+                "📎 Это наш файл-пример — его разбор ниже 👇\n\n"
+                "Чтобы увидеть <b>свои</b> цифры, пришли детализацию из кабинета:\n"
+                f"{DEMO_HOW_TO.get(demo_mp, '')}.",
+                parse_mode="HTML",
+            )
+            report = await _demo_report_text(demo_mp)
+            chunks = split_text(report, max_len=4000)
+            for i, chunk in enumerate(chunks):
+                await message.answer(
+                    chunk, parse_mode="HTML",
+                    reply_markup=get_demo_report_keyboard(demo_mp) if i == len(chunks) - 1 else None,
+                )
+            return
+
         # Анализируем в отдельном потоке, чтобы не блокировать event loop
         result, metrics = await asyncio.to_thread(analyze_full, tmp_path)
         marketplace = metrics.get("marketplace", "?")
@@ -1572,7 +1709,7 @@ async def handle_document(message: Message):
 
         # Увеличиваем счётчик отчётов
         report_num = increment_report_count(user_id)
-        _event(user_id, "report")
+        _event(user_id, f"report:{marketplace if marketplace in ('WB', 'Ozon') else 'другое'}")
         logger.info("Отчёт #%s отправлен пользователю %s", report_num, user_id)
 
         # После первого отчёта — запрос обратной связи
