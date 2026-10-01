@@ -207,7 +207,7 @@ def generate_insight_ozon(sku: str, row, total_income: float) -> str:
         lines.append(
             f"📦 Drop-off-обработка слишком дорогая "
             f"({fmt(drop_off / income * 100)}% от выручки).\n"
-            f"     Для тяжёлых товаров выгоднее отправлять со своего склада (FBO)."
+            f"     Drop-off — это плата за FBS. Для ходовых товаров посчитайте поставку на склад Ozon (FBO)."
         )
 
     if net < 0 and not lines:

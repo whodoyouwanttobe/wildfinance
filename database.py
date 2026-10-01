@@ -140,6 +140,14 @@ def get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
         )
     """)
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_events (
+            user_id    INTEGER NOT NULL,
+            event      TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_user_events_user ON user_events (user_id)")
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS receipts (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             charge_id   TEXT UNIQUE NOT NULL,
@@ -656,7 +664,60 @@ def delete_user_data(user_id: int, db_path: str = DB_PATH) -> None:
         conn.execute("DELETE FROM pending_payments WHERE user_id = ? AND paid = 0", (user_id,))
         conn.execute("DELETE FROM sales_daily WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM report_ranges WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM user_events WHERE user_id = ?", (user_id,))
         conn.execute("UPDATE users SET username = NULL, source = '' WHERE user_id = ?", (user_id,))
         conn.commit()
+    finally:
+        conn.close()
+
+
+# ─── События воронки (для CRM: перешёл, смотрел пример, прислал отчёт, оплатил) ─
+
+def log_event(user_id: int, event: str, db_path: str | None = None) -> None:
+    conn = get_connection(db_path or DB_PATH)
+    try:
+        conn.execute(
+            "INSERT INTO user_events (user_id, event, created_at) VALUES (?, ?, ?)",
+            (user_id, event, datetime.utcnow().isoformat(timespec="seconds")),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_crm_rows(db_path: str | None = None) -> list[dict]:
+    """Все пользователи с воронкой: события, отчёты, оплаты. Только для админки/CRM."""
+    conn = get_connection(db_path or DB_PATH)
+    try:
+        users = conn.execute(
+            "SELECT user_id, username, source, join_date, report_count, access_until FROM users"
+        ).fetchall()
+        events: dict[int, dict] = {}
+        for uid, ev, cnt, first, last in conn.execute(
+            "SELECT user_id, event, COUNT(*), MIN(created_at), MAX(created_at) "
+            "FROM user_events GROUP BY user_id, event"
+        ):
+            events.setdefault(uid, {})[ev] = {"count": cnt, "first": first, "last": last}
+        paid = {
+            uid: (cnt, total)
+            for uid, cnt, total in conn.execute(
+                "SELECT user_id, COUNT(*), SUM(amount) FROM payments GROUP BY user_id"
+            )
+        }
+        rows = []
+        for uid, username, source, join_date, reports, access_until in users:
+            cnt, total = paid.get(uid, (0, 0))
+            rows.append({
+                "user_id": uid,
+                "username": username or "",
+                "source": source or "",
+                "join_date": join_date,
+                "reports": reports or 0,
+                "access_until": access_until,
+                "payments": cnt,
+                "paid_rub": round((total or 0) / 100),
+                "events": events.get(uid, {}),
+            })
+        return rows
     finally:
         conn.close()

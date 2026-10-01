@@ -78,11 +78,13 @@ from database import (
     get_user_receipts,
     get_pending_receipts,
     delete_user_data,
+    log_event,
 )
 import yoomoney_pay as ym
 import legal
 import nalog_receipts as NR
 import history as H
+import crm
 from wb_parser import analyze as wb_analyze
 from ozon_parser import analyze as ozon_analyze
 from parser_dispatcher import analyze, analyze_full, detect_marketplace, compute
@@ -538,13 +540,21 @@ def get_post_report_keyboard() -> InlineKeyboardMarkup:
 # ХЕНДЛЕРЫ КОМАНД
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _event(user_id: int, event: str) -> None:
+    """Событие воронки для CRM. Ошибки не должны мешать работе бота."""
+    try:
+        log_event(user_id, event)
+    except Exception:
+        logger.exception("Не удалось записать событие %s для %s", event, user_id)
+
+
 def _parse_start_source(text: str) -> str:
     """'/start wbchat' → 'wbchat'. Только латиница/цифры/_/-, до 32 символов."""
     parts = text.strip().split(maxsplit=1)
     if len(parts) < 2:
         return ""
     arg = parts[1].strip()
-    return arg[:32] if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", arg) else ""
+    return arg[:64] if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", arg) else ""
 
 
 @dp.message(CommandStart())
@@ -555,6 +565,7 @@ async def cmd_start(message: Message):
 
     is_new = add_user(user_id, username)
     source = _parse_start_source(message.text if isinstance(message.text, str) else "")
+    _event(user_id, f"start:{source}" if source else "start")
     if is_new:
         logger.info("Новый пользователь: %s (@%s), источник: %s", user_id, username, source or "—")
         if source:
@@ -616,6 +627,7 @@ async def cmd_ai(message: Message):
 @dp.message(F.text == "💳 Оплатить доступ")
 async def cmd_buy(message: Message):
     """Обработчик команды /buy — показывает варианты оплаты."""
+    _event(message.from_user.id, "buy_open")
     text = "💎 <b>Тарифы</b>\n\n" + tariffs_text() + "\n\n"
     if ym.enabled():
         text += "Оплата картой или ЮMoney, доступ откроется автоматически в течение минуты:"
@@ -766,6 +778,7 @@ async def _grant_paid_access(
         return False
 
     until = extend_access(user_id, plan["days"])
+    _event(user_id, "paid")
     until_text = "навсегда" if plan_key == "forever" else f"до {until[:10]}"
     receipt_no, receipt_link = await _issue_receipt(charge_id, user_id, plan_key, amount_kop)
     try:
@@ -988,6 +1001,7 @@ async def callback_ym_buy(callback: CallbackQuery):
     await callback.answer()
     user_id = callback.from_user.id
     plan_key = callback.data.removeprefix("ym_")
+    _event(user_id, "buy_click")
     if not await _plan_still_on_sale(callback, plan_key):
         return
     plan = PLANS[plan_key]
@@ -1175,6 +1189,7 @@ async def callback_demo(callback: CallbackQuery):
     """Пример: сразу разбор + файл под ним. Доступ и счётчик отчётов не трогаем."""
     await callback.answer()
     marketplace = callback.data.removeprefix("demo_")
+    _event(callback.from_user.id, "demo")
     path = DEMO_FILES.get(marketplace)
     if not path or not os.path.exists(path):
         await callback.message.answer("😔 Пример сейчас недоступен. Попробуй позже.")
@@ -1557,6 +1572,7 @@ async def handle_document(message: Message):
 
         # Увеличиваем счётчик отчётов
         report_num = increment_report_count(user_id)
+        _event(user_id, "report")
         logger.info("Отчёт #%s отправлен пользователю %s", report_num, user_id)
 
         # После первого отчёта — запрос обратной связи
@@ -2657,6 +2673,10 @@ async def main():
     except Exception as exc:
         logger.warning("Оферта: не удалось опубликовать на telegra.ph (%s) — /terms покажет текст в чате", exc)
     logger.info("Чеки «Мой налог»: %s", "автоматически" if NR.auto_enabled() else "вручную (/receipt)")
+    try:
+        await crm.start_server()
+    except Exception as exc:
+        logger.warning("CRM API не запустился: %s", exc)
     await dp.start_polling(bot)
 
 

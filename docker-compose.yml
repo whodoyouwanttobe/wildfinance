@@ -5,6 +5,8 @@ services:
     container_name: wildfinance-bot
     restart: unless-stopped          # поднимется сам после падения и перезагрузки сервера
     env_file: .env                   # секреты лежат только на сервере
+    ports:
+      - "8088:8088"                  # CRM API для Obsidian (работает, только если задан CRM_TOKEN)
     environment:
       DATA_DIR: /app/data
     volumes:
