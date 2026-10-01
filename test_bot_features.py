@@ -31,6 +31,8 @@ def db(tmp_path, monkeypatch):
                  "delete_user_data"):
         fn = getattr(database, name)
         monkeypatch.setattr(B, name, lambda *a, _fn=fn, **k: _fn(*a, db_path=path, **k))
+    # history.py берёт путь из database.DB_PATH в момент вызова
+    monkeypatch.setattr(database, "DB_PATH", path)
     return path
 
 
@@ -506,7 +508,8 @@ async def test_report_trial_user_sees_promo_and_inline_buttons(db, monkeypatch):
     assert "/buy" in full and "Пробный период" in full
     last_report = [c for c in calls if c.kwargs.get("reply_markup") is not None][0]
     kb = last_report.kwargs["reply_markup"].inline_keyboard
-    assert kb[0][0].callback_data == "cost_menu" and kb[1][0].callback_data == "post_review"
+    assert kb[0][0].callback_data == "cost_menu" and kb[1][0].callback_data == "xyz"
+    assert kb[2][0].callback_data == "post_review"
     assert report_call is not None
 
 

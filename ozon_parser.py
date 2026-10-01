@@ -65,6 +65,10 @@ POKATUSHKI_MIN_TRIPS = 2
 # ─── Утилиты ──────────────────────────────────────────────────────────────────
 
 
+# Дата начисления для истории продаж (XYZ-анализ), по приоритету
+DATE_COLUMNS = ("Дата начисления", "Дата операции", "Дата")
+
+
 def detect_column_mapping(df: pd.DataFrame) -> dict:
     """Проверяет, что отчёт похож на Ozon (по обязательным колонкам)."""
     cols = set(df.columns)
@@ -324,8 +328,17 @@ def compute(filepath: str) -> dict:
     ]
 
     grouped = _group_ozon(df)
+    date_col = next((c for c in DATE_COLUMNS if c in df.columns), None)
+    rows = pd.DataFrame({
+        "дата": df[date_col] if date_col else pd.Series(None, index=df.index, dtype=object),
+        "артикул": df["_sku"],
+        "шт": df["_шт"],
+        "выплата": df["_сумма"],
+        "выручка": df["_сумма"].where(df["_категория"] == "доход", 0),
+    })
     return {
         "marketplace": "Ozon",
+        "rows": rows,
         "доход": float(grouped["доход"].sum()),
         "логистика": float(grouped["логистика"].sum()),
         "хранение": float(grouped["хранение"].sum()),

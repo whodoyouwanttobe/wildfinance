@@ -115,6 +115,31 @@ def get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
         )
     """)
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS sales_daily (
+            user_id     INTEGER NOT NULL,
+            marketplace TEXT NOT NULL,
+            day         TEXT NOT NULL,
+            article     TEXT NOT NULL,
+            label       TEXT DEFAULT '',
+            name        TEXT DEFAULT '',
+            qty         REAL DEFAULT 0,
+            payout      REAL DEFAULT 0,
+            revenue     REAL DEFAULT 0,
+            PRIMARY KEY (user_id, marketplace, day, article)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS report_ranges (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER NOT NULL,
+            marketplace TEXT NOT NULL,
+            start_day   TEXT NOT NULL,
+            end_day     TEXT NOT NULL,
+            dated       INTEGER DEFAULT 1,
+            created_at  TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS receipts (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             charge_id   TEXT UNIQUE NOT NULL,
@@ -617,7 +642,7 @@ def get_pending_receipts(db_path: str = DB_PATH) -> list[dict]:
 
 def delete_user_data(user_id: int, db_path: str = DB_PATH) -> None:
     """
-    Удаляет себестоимость, налоговые настройки, показатели отчётов, отзывы,
+    Удаляет себестоимость, налоговые настройки, показатели и историю отчётов, отзывы,
     неоплаченные счета и имя пользователя. Платежи и чеки остаются
     (их нужно хранить по налоговому законодательству), строка users —
     чтобы не выдавать пробный период повторно.
@@ -629,6 +654,8 @@ def delete_user_data(user_id: int, db_path: str = DB_PATH) -> None:
         conn.execute("DELETE FROM last_reports WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM feedback WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM pending_payments WHERE user_id = ? AND paid = 0", (user_id,))
+        conn.execute("DELETE FROM sales_daily WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM report_ranges WHERE user_id = ?", (user_id,))
         conn.execute("UPDATE users SET username = NULL, source = '' WHERE user_id = ?", (user_id,))
         conn.commit()
     finally:

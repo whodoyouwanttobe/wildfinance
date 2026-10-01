@@ -82,6 +82,7 @@ from database import (
 import yoomoney_pay as ym
 import legal
 import nalog_receipts as NR
+import history as H
 from wb_parser import analyze as wb_analyze
 from ozon_parser import analyze as ozon_analyze
 from parser_dispatcher import analyze, analyze_full, detect_marketplace, compute
@@ -339,6 +340,7 @@ HELP_TEXT = (
     "  /wbozon — WB против Ozon: где выгоднее продавать\n"
     "  /cost — себестоимость товаров (для расчёта прибыли)\n"
     "  /tax — система налогообложения\n"
+    "  /xyz — матрица ABC × XYZ по истории отчётов\n"
     "  /ai — AI-разбор последнего отчёта\n"
     "  /buy — тарифы и оплата\n"
     "  /receipts — мои чеки об оплате\n"
@@ -501,6 +503,12 @@ def get_post_report_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(
                 text="💰 Указать себестоимость → прибыль",
                 callback_data="cost_menu",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="📈 ABC × XYZ (по неделям)",
+                callback_data="xyz",
             ),
         ],
         [
@@ -939,7 +947,7 @@ async def cmd_privacy(message: Message):
 async def cmd_delete_me(message: Message):
     await message.answer(
         "🗑 <b>Удалить мои данные?</b>\n\n"
-        "Удалятся: себестоимость, налоговые настройки, показатели последнего отчёта, "
+        "Удалятся: себестоимость, налоговые настройки, показатели и история отчётов, "
         "отзывы и имя пользователя.\n"
         "Останутся: сведения об оплатах и чеках (их нужно хранить по налоговому "
         "законодательству) и срок доступа.",
@@ -1073,6 +1081,52 @@ async def cmd_paysupport(message: Message):
         "Отправьте /cancel, чтобы выйти.",
         parse_mode="HTML",
     )
+
+
+# ─── История продаж и ABC × XYZ ─────────────────────────────────────────────
+
+def _history_line(hist: dict | None) -> str:
+    """Строка под отчётом: сколько недель истории накоплено для XYZ."""
+    if not hist:
+        return ""
+    period = ""
+    if hist.get("start") and hist.get("end"):
+        period = f" (период отчёта {hist['start']:%d.%m}–{hist['end']:%d.%m}"
+        period += ")" if hist.get("dated", True) else ", даты не найдены — считаю прошлой неделей)"
+    if hist["ready"]:
+        return (f"\n\n📈 История: <b>{hist['weeks']} нед.</b>{period} — матрица ABC × XYZ готова: "
+                "кнопка ниже или /xyz")
+    return (f"\n\n📈 История для ABC × XYZ: <b>{hist['weeks']} из {H.MIN_WEEKS}</b> полных недель{period}. "
+            "Пришли отчёты за прошлые недели — матрица посчитается сама.")
+
+
+async def _send_xyz(message: Message, user_id: int) -> None:
+    mps = H.marketplaces_with_history(user_id)
+    if not mps:
+        await message.answer(
+            "📈 <b>ABC × XYZ</b> показывает, какие товары приносят деньги (ABC) и насколько "
+            f"стабильно продаются (XYZ). Для этого нужна история минимум за {H.MIN_WEEKS} недели.\n\n"
+            "Пришли еженедельные отчёты — можно сразу несколько, по одному файлу.",
+            parse_mode="HTML",
+        )
+        return
+    last_mp = (_last_reports.get(user_id) or {}).get("marketplace")
+    mps.sort(key=lambda m: m != last_mp)
+    for mp in mps:
+        result = await asyncio.to_thread(H.compute_matrix, user_id, mp)
+        for chunk in split_text(H.render(result), max_len=4000):
+            await message.answer(chunk, parse_mode="HTML")
+
+
+@dp.message(Command("xyz"))
+async def cmd_xyz(message: Message):
+    await _send_xyz(message, message.from_user.id)
+
+
+@dp.callback_query(F.data == "xyz")
+async def callback_xyz(callback: CallbackQuery):
+    await callback.answer()
+    await _send_xyz(callback.message, callback.from_user.id)
 
 
 # ─── Пример отчёта, статистика, приглашение ─────────────────────────────────
@@ -1460,6 +1514,14 @@ async def handle_document(message: Message):
         except Exception:
             logger.exception("Не удалось сохранить снимок отчёта для %s", user_id)
 
+        # История продаж по дням → XYZ-анализ, когда накопится MIN_WEEKS полных недель
+        history_line = ""
+        try:
+            hist = await asyncio.to_thread(H.save_report, user_id, metrics)
+            history_line = _history_line(hist)
+        except Exception:
+            logger.exception("Не удалось сохранить историю продаж для %s", user_id)
+
         # Удаляем «анализирую...»
         try:
             await processing_msg.delete()
@@ -1469,7 +1531,7 @@ async def handle_document(message: Message):
         # Отправляем результат (HTML). Кнопки действий — прямо под последней частью
         # отчёта (без отдельного сообщения «Что дальше?»), реклама тарифов — только
         # тем, у кого нет оплаченного доступа.
-        shown = result + report_promo_footer(user_id)
+        shown = result + history_line + report_promo_footer(user_id)
         chunks = split_text(shown, max_len=4000)
         for i, chunk in enumerate(chunks):
             await message.answer(

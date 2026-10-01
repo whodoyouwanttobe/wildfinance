@@ -125,6 +125,7 @@ def db(tmp_path, monkeypatch):
                  "save_last_report", "get_last_report", "set_user_source"):
         fn = getattr(database, name)
         monkeypatch.setattr(B, name, lambda *a, _fn=fn, **k: _fn(*a, db_path=path, **k))
+    monkeypatch.setattr(database, "DB_PATH", path)
     monkeypatch.setattr(B, "ADMIN_ID", 0)
     B._cost_state.clear()
     database.save_last_report(1, SNAP, "r.xlsx", db_path=path)

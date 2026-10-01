@@ -71,6 +71,8 @@ GROSS_COLUMNS = (
     "Цена розничная",
 )
 NAME_COLUMNS = ("Название", "Предмет")
+# Дата операции для истории продаж (XYZ-анализ), по приоритету
+DATE_COLUMNS = ("Дата продажи", "Дата операции", "Дата заказа покупателем", "Дата")
 COL_ВИДЫ = "Виды доставок, штрафов и корректировок ВВ"
 
 
@@ -346,7 +348,22 @@ def compute(filepath: str) -> dict:
         "удержания": float(общие_удержания),
         "чистая_прибыль": float(чистая_прибыль),
         "grouped": grouped,
+        "rows": _history_rows(df, DATE_COLUMNS),
     }
+
+
+def _history_rows(df: pd.DataFrame, date_columns) -> pd.DataFrame:
+    """Построчные данные для истории продаж: дата, артикул, штуки, выплата, выручка."""
+    date_col = next((c for c in date_columns if c in df.columns), None)
+    rows = pd.DataFrame({
+        "дата": df[date_col] if date_col else pd.Series(None, index=df.index, dtype=object),
+        "артикул": df["_артикул"],
+        "шт": df["_шт"],
+        "выплата": df["_доход_продажи"] - df["_логистика"] - df["_штрафы"]
+                   - df["_хранение"] - df["_приёмка"] - df["_удержания"],
+        "выручка": df["_брутто"],
+    })
+    return rows
 
 
 def analyze(filepath: str, m: dict | None = None) -> str:
