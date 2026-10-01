@@ -1081,16 +1081,44 @@ async def cmd_paysupport(message: Message):
 @dp.message(F.text == "📊 Получить пример отчёта")
 async def cmd_demo(message: Message):
     await message.answer(
-        "📊 <b>Какой пример прислать?</b>\n\n"
-        "Это реалистичный отчёт магазина. Скачай его и отправь мне обратно — "
-        "увидишь полный разбор: прибыль, штрафы, ABC-анализ и советы.",
+        "📊 <b>Пример какого маркетплейса показать?</b>\n\n"
+        "Сразу пришлю готовый разбор реалистичного отчёта магазина: прибыль, "
+        "штрафы, логистику, ABC-анализ и советы. Под разбором — сам файл, "
+        "чтобы было видно, из чего он сделан.",
         parse_mode="HTML",
         reply_markup=get_demo_keyboard(),
     )
 
 
+# Разбор примера и AI-выводы по нему одинаковы для всех — считаем один раз
+_demo_cache: dict[str, str] = {}
+_demo_ai_cache: dict[str, str] = {}
+
+DEMO_HOW_TO = {
+    "WB": "Личный кабинет WB → Финансы → Детализация",
+    "Ozon": "Личный кабинет Ozon → Финансы → Детализация начислений",
+}
+
+
+def get_demo_report_keyboard(marketplace: str) -> InlineKeyboardMarkup:
+    other = "Ozon" if marketplace == "WB" else "WB"
+    other_icon = "🔵" if other == "Ozon" else "🟣"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🤖 AI-разбор примера", callback_data=f"demoai_{marketplace}")],
+        [InlineKeyboardButton(text=f"{other_icon} Пример {other}", callback_data=f"demo_{other}")],
+    ])
+
+
+async def _demo_report_text(marketplace: str) -> str:
+    if marketplace not in _demo_cache:
+        text, _metrics = await asyncio.to_thread(analyze_full, DEMO_FILES[marketplace])
+        _demo_cache[marketplace] = text
+    return _demo_cache[marketplace]
+
+
 @dp.callback_query(F.data.startswith("demo_"))
 async def callback_demo(callback: CallbackQuery):
+    """Пример: сразу разбор + файл под ним. Доступ и счётчик отчётов не трогаем."""
     await callback.answer()
     marketplace = callback.data.removeprefix("demo_")
     path = DEMO_FILES.get(marketplace)
@@ -1098,18 +1126,66 @@ async def callback_demo(callback: CallbackQuery):
         await callback.message.answer("😔 Пример сейчас недоступен. Попробуй позже.")
         logger.error("Демо-файл не найден: %s", path)
         return
-    how = (
-        "WB: Финансы → Детализация" if marketplace == "WB"
-        else "Ozon: Финансы → Детализация начислений"
+
+    wait = await callback.message.answer(f"⏳ Разбираю пример отчёта {marketplace}…")
+    try:
+        report = await _demo_report_text(marketplace)
+    except Exception:
+        logger.exception("Не удалось разобрать демо-файл %s", path)
+        await wait.edit_text("😔 Пример сейчас недоступен. Попробуй позже.")
+        return
+    try:
+        await wait.delete()
+    except Exception:
+        pass
+
+    shown = (
+        f"📊 <b>ПРИМЕР РАЗБОРА — {marketplace}</b>\n"
+        "<i>Так выглядит анализ твоего отчёта. Магазин условный, формат файла — настоящий.</i>\n\n"
+        + report
     )
+    chunks = split_text(shown, max_len=4000)
+    for i, chunk in enumerate(chunks):
+        await callback.message.answer(
+            chunk,
+            parse_mode="HTML",
+            reply_markup=get_demo_report_keyboard(marketplace) if i == len(chunks) - 1 else None,
+        )
+
     await callback.message.answer_document(
         FSInputFile(path, filename=f"пример_отчёта_{marketplace}.xlsx"),
         caption=(
-            f"📎 Пример отчёта {marketplace}.\n\n"
-            "👉 Перешли этот файл обратно в чат — получишь разбор.\n"
-            f"Свой отчёт выгружается здесь: {how}."
+            f"📎 Файл, из которого сделан разбор выше.\n\n"
+            f"👉 Пришли сюда свой отчёт — получишь такой же разбор по своим цифрам.\n"
+            f"Где скачать: {DEMO_HOW_TO.get(marketplace, '')}."
         ),
     )
+
+
+@dp.callback_query(F.data.startswith("demoai_"))
+async def callback_demo_ai(callback: CallbackQuery):
+    """AI-разбор примера (кэшируется — один запрос к AI на маркетплейс)."""
+    await callback.answer()
+    marketplace = callback.data.removeprefix("demoai_")
+    if marketplace not in DEMO_FILES:
+        return
+    if marketplace in _demo_ai_cache:
+        await callback.message.answer(_demo_ai_cache[marketplace], parse_mode="HTML")
+        return
+    ai = get_ai_client()
+    if not ai.available:
+        await callback.message.answer(AI_UNAVAILABLE_TEXT, parse_mode="HTML")
+        return
+    thinking = await callback.message.answer("🤖 AI анализирует пример… ⏳")
+    try:
+        report = await _demo_report_text(marketplace)
+        summary = await ai_summarize_report(report_text=report, marketplace=marketplace)
+        text = f"🤖 <b>AI-разбор примера ({marketplace}):</b>\n\n{_html_escape(summary)}"
+        _demo_ai_cache[marketplace] = text
+        await thinking.edit_text(text, parse_mode="HTML")
+    except Exception as exc:
+        logger.exception("AI-сбой на примере %s: %s", marketplace, exc)
+        await thinking.edit_text("🤖 Не удалось получить AI-разбор. Попробуй позже.")
 
 
 @dp.message(Command("stats"))

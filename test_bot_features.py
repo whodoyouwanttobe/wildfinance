@@ -65,13 +65,62 @@ async def test_demo_button_offers_choice():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mp", ["WB", "Ozon"])
-async def test_demo_sends_existing_file(mp):
+async def test_demo_sends_report_then_file(mp):
     c = _cb(data=f"demo_{mp}")
     await B.callback_demo(c)
+    # Сначала разбор (HTML), потом файл
+    texts = [call.args[0] for call in c.message.answer.call_args_list]
+    report = "\n".join(t for t in texts if "ПРИМЕР РАЗБОРА" in t or "К ВЫПЛАТЕ" in t)
+    assert f"ПРИМЕР РАЗБОРА — {mp}" in report
+    assert "К ВЫПЛАТЕ" in report
+    kb = c.message.answer.call_args_list[-1].kwargs["reply_markup"]
+    datas = [b.callback_data for row in kb.inline_keyboard for b in row]
+    other = "Ozon" if mp == "WB" else "WB"
+    assert datas == [f"demoai_{mp}", f"demo_{other}"]
     c.message.answer_document.assert_called_once()
     sent = c.message.answer_document.call_args.args[0]
     assert os.path.exists(sent.path)
     assert B.detect_marketplace(sent.path) == mp
+    assert "свой отчёт" in c.message.answer_document.call_args.kwargs["caption"]
+
+
+@pytest.mark.asyncio
+async def test_demo_does_not_touch_user_report_or_counter(db):
+    B._last_reports[5] = {"text": "мой отчёт", "marketplace": "WB"}
+    c = _cb(5, data="demo_WB")
+    await B.callback_demo(c)
+    assert B._last_reports[5]["text"] == "мой отчёт"
+    assert B.get_user(5) is None or B.get_user(5).get("report_count", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_demo_ai_is_cached(monkeypatch):
+    B._demo_ai_cache.clear()
+    calls = []
+
+    async def fake_ai(report_text, marketplace):
+        calls.append(marketplace)
+        return "Вывод <1>"
+
+    monkeypatch.setattr(B, "ai_summarize_report", fake_ai)
+    monkeypatch.setattr(B, "get_ai_client", lambda: SimpleNamespace(available=True))
+    c = _cb(data="demoai_Ozon")
+    await B.callback_demo_ai(c)
+    thinking = c.message.answer.return_value
+    assert "Вывод &lt;1&gt;" in thinking.edit_text.call_args.args[0]
+    c2 = _cb(data="demoai_Ozon")
+    await B.callback_demo_ai(c2)
+    assert calls == ["Ozon"]
+    assert "Вывод" in c2.message.answer.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_demo_ai_unavailable(monkeypatch):
+    B._demo_ai_cache.clear()
+    monkeypatch.setattr(B, "get_ai_client", lambda: SimpleNamespace(available=False))
+    c = _cb(data="demoai_WB")
+    await B.callback_demo_ai(c)
+    assert "недоступен" in c.message.answer.call_args.args[0]
 
 
 # ─── Жалобы: обычный текст после отчёта НЕ должен уходить админу ────────────
