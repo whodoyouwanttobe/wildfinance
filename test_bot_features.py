@@ -26,7 +26,9 @@ def db(tmp_path, monkeypatch):
                  "record_payment", "increment_report_count", "has_given_feedback",
                  "save_feedback", "add_pending_payment", "get_pending_payments",
                  "mark_pending_paid", "set_costs", "get_costs", "delete_cost", "get_tax",
-                 "set_tax", "save_last_report", "get_last_report", "set_user_source"):
+                 "set_tax", "save_last_report", "get_last_report", "set_user_source",
+                 "add_receipt", "set_receipt_url", "get_user_receipts", "get_pending_receipts",
+                 "delete_user_data"):
         fn = getattr(database, name)
         monkeypatch.setattr(B, name, lambda *a, _fn=fn, **k: _fn(*a, db_path=path, **k))
     return path

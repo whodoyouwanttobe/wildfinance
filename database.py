@@ -114,6 +114,18 @@ def get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
             paid       INTEGER DEFAULT 0
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS receipts (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            charge_id   TEXT UNIQUE NOT NULL,
+            user_id     INTEGER NOT NULL,
+            plan        TEXT NOT NULL,
+            amount      INTEGER NOT NULL,
+            url         TEXT DEFAULT '',
+            created_at  TEXT NOT NULL,
+            issued_at   TEXT DEFAULT NULL
+        )
+    """)
     conn.commit()
     return conn
 
@@ -533,5 +545,91 @@ def get_last_report(user_id: int, db_path: str = DB_PATH) -> dict | None:
         snap = json.loads(row[0])
         snap["file_name"] = row[1] or ""
         return snap
+    finally:
+        conn.close()
+
+
+# ─── Чеки «Мой налог» ─────────────────────────────────────────────────────────
+
+def add_receipt(charge_id: str, user_id: int, plan: str, amount: int, db_path: str = DB_PATH) -> int:
+    """Создаёт запись «нужен чек» для платежа. Возвращает номер чека (id)."""
+    conn = get_connection(db_path)
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO receipts (charge_id, user_id, plan, amount, created_at) VALUES (?, ?, ?, ?, ?)",
+            (charge_id, user_id, plan, amount, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+        row = conn.execute("SELECT id FROM receipts WHERE charge_id = ?", (charge_id,)).fetchone()
+        return int(row[0])
+    finally:
+        conn.close()
+
+
+def _receipt_row(row) -> dict | None:
+    if not row:
+        return None
+    keys = ("id", "charge_id", "user_id", "plan", "amount", "url", "created_at", "issued_at")
+    return dict(zip(keys, row))
+
+
+_RECEIPT_COLS = "id, charge_id, user_id, plan, amount, url, created_at, issued_at"
+
+
+def set_receipt_url(receipt_id: int, url: str, db_path: str = DB_PATH) -> dict | None:
+    """Сохраняет ссылку на чек. Возвращает запись или None, если номера нет."""
+    conn = get_connection(db_path)
+    try:
+        conn.execute(
+            "UPDATE receipts SET url = ?, issued_at = ? WHERE id = ?",
+            (url, datetime.utcnow().isoformat(), receipt_id),
+        )
+        conn.commit()
+        return _receipt_row(conn.execute(
+            f"SELECT {_RECEIPT_COLS} FROM receipts WHERE id = ?", (receipt_id,)).fetchone())
+    finally:
+        conn.close()
+
+
+def get_user_receipts(user_id: int, db_path: str = DB_PATH) -> list[dict]:
+    conn = get_connection(db_path)
+    try:
+        rows = conn.execute(
+            f"SELECT {_RECEIPT_COLS} FROM receipts WHERE user_id = ? ORDER BY id DESC LIMIT 20", (user_id,)
+        ).fetchall()
+        return [_receipt_row(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_pending_receipts(db_path: str = DB_PATH) -> list[dict]:
+    conn = get_connection(db_path)
+    try:
+        rows = conn.execute(
+            f"SELECT {_RECEIPT_COLS} FROM receipts WHERE url = '' OR url IS NULL ORDER BY id"
+        ).fetchall()
+        return [_receipt_row(r) for r in rows]
+    finally:
+        conn.close()
+
+
+# ─── Удаление данных по запросу пользователя (152-ФЗ) ────────────────────────
+
+def delete_user_data(user_id: int, db_path: str = DB_PATH) -> None:
+    """
+    Удаляет себестоимость, налоговые настройки, показатели отчётов, отзывы,
+    неоплаченные счета и имя пользователя. Платежи и чеки остаются
+    (их нужно хранить по налоговому законодательству), строка users —
+    чтобы не выдавать пробный период повторно.
+    """
+    conn = get_connection(db_path)
+    try:
+        conn.execute("DELETE FROM costs WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM user_settings WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM last_reports WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM feedback WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM pending_payments WHERE user_id = ? AND paid = 0", (user_id,))
+        conn.execute("UPDATE users SET username = NULL, source = '' WHERE user_id = ?", (user_id,))
+        conn.commit()
     finally:
         conn.close()

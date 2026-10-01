@@ -46,6 +46,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     ReplyKeyboardMarkup,
     KeyboardButton,
+    LinkPreviewOptions,
 )
 
 from database import (
@@ -72,8 +73,15 @@ from database import (
     add_pending_payment,
     get_pending_payments,
     mark_pending_paid,
+    add_receipt,
+    set_receipt_url,
+    get_user_receipts,
+    get_pending_receipts,
+    delete_user_data,
 )
 import yoomoney_pay as ym
+import legal
+import nalog_receipts as NR
 from wb_parser import analyze as wb_analyze
 from ozon_parser import analyze as ozon_analyze
 from parser_dispatcher import analyze, analyze_full, detect_marketplace, compute
@@ -303,7 +311,8 @@ WELCOME_TEXT = (
     "Команды:\n"
     "  /compare — сравнить два отчёта (было → стало)\n"
     "  /buy — тарифы и оплата\n"
-    "  /help — помощь"
+    "  /help — помощь\n\n"
+    "<i>Пользуясь ботом, вы соглашаетесь с /terms и /privacy.</i>"
 )
 
 def trial_expired_text() -> str:
@@ -332,7 +341,10 @@ HELP_TEXT = (
     "  /tax — система налогообложения\n"
     "  /ai — AI-разбор последнего отчёта\n"
     "  /buy — тарифы и оплата\n"
-    "  /start — начать заново"
+    "  /receipts — мои чеки об оплате\n"
+    "  /start — начать заново\n\n"
+    "📄 Документы: /terms — оферта, /privacy — персональные данные, "
+    "/delete_me — удалить мои данные"
 )
 
 SUPPORTED_EXTENSIONS = (".xlsx", ".xls", ".csv")
@@ -606,7 +618,11 @@ async def cmd_buy(message: Message):
             "После оплаты пришли сюда чек — доступ откроем вручную.\n"
             "Выбери тариф:"
         )
-    await message.answer(text, parse_mode="HTML", reply_markup=get_buy_keyboard())
+    text += "\n\n<i>" + legal.links_html() + "</i>"
+    await message.answer(
+        text, parse_mode="HTML", reply_markup=get_buy_keyboard(),
+        link_preview_options=NO_PREVIEW,
+    )
 
 
 # ─── Автооплата (Telegram Payments + ЮKassa) ────────────────────────────────
@@ -743,14 +759,19 @@ async def _grant_paid_access(
 
     until = extend_access(user_id, plan["days"])
     until_text = "навсегда" if plan_key == "forever" else f"до {until[:10]}"
+    receipt_no, receipt_link = await _issue_receipt(charge_id, user_id, plan_key, amount_kop)
     try:
         await bot.send_message(
             user_id,
             f"🎉 <b>Оплата прошла!</b>\n\nДоступ открыт {until_text}.\n"
-            "Присылай отчёт — разберу его за секунды.",
+            "Присылай отчёт — разберу его за секунды.\n\n"
+            + ("🧾 Чек — в следующем сообщении." if receipt_link else
+               "🧾 Чек из «Мой налог» пришлю сюда в течение дня. Все чеки — /receipts."),
             parse_mode="HTML",
             reply_markup=get_main_keyboard(),
         )
+        if receipt_link:
+            await _send_receipt_to_user(user_id, receipt_link)
     except Exception:
         logger.exception("Не удалось сообщить пользователю %s об оплате", user_id)
     logger.info("Оплата (%s): user=%s plan=%s amount=%s", provider_name, user_id, plan_key, amount_kop)
@@ -763,12 +784,185 @@ async def _grant_paid_access(
                 f"@{_html_escape(username or '—')} (<code>{user_id}</code>)\n"
                 f"Тариф: {plan['title']}\n"
                 f"Сумма: {amount_kop / 100:.0f} руб.\n"
-                f"ID платежа: <code>{_html_escape(provider_id or charge_id)}</code>",
+                f"ID платежа: <code>{_html_escape(provider_id or charge_id)}</code>\n"
+                + (f"🧾 Чек №{receipt_no} создан автоматически ✅" if receipt_link
+                   else f"🧾 Чек №{receipt_no}: нужно создать вручную ⬇️"),
                 parse_mode="HTML",
             )
+            if not receipt_link:
+                await bot.send_message(
+                    ADMIN_ID,
+                    NR.manual_instructions(
+                        receipt_no, plan_key, amount_kop / 100,
+                        datetime.now(MSK).strftime("%d.%m.%Y %H:%M"),
+                    ),
+                    parse_mode="HTML",
+                )
         except Exception:
             logger.exception("Не удалось уведомить админа об оплате")
     return True
+
+
+# ─── Чеки самозанятого («Мой налог») ────────────────────────────────────────
+
+NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
+
+
+async def _issue_receipt(charge_id: str, user_id: int, plan_key: str, amount_kop: int) -> tuple[int, str]:
+    """Заводит чек для платежа и пробует создать его автоматически. → (номер, ссылка|'')."""
+    try:
+        receipt_no = add_receipt(charge_id, user_id, plan_key, amount_kop)
+    except Exception:
+        logger.exception("Чек: не удалось сохранить запись для %s", charge_id)
+        return 0, ""
+    client = NR.get_client()
+    if client is None:
+        return receipt_no, ""
+    try:
+        _uuid, link = await client.create_receipt(plan_key, amount_kop / 100)
+        set_receipt_url(receipt_no, link)
+        logger.info("Чек №%s создан в «Мой налог»: %s", receipt_no, link)
+        return receipt_no, link
+    except Exception as exc:
+        logger.warning("Чек №%s: авто-создание не удалось, нужен ручной: %s", receipt_no, exc)
+        return receipt_no, ""
+
+
+def _receipt_keyboard(link: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🧾 Открыть чек", url=link),
+    ]])
+
+
+async def _send_receipt_to_user(user_id: int, link: str) -> None:
+    await bot.send_message(
+        user_id,
+        "🧾 <b>Чек об оплате</b> (сформирован в «Мой налог», ФНС).\n"
+        "Все чеки — по команде /receipts.",
+        parse_mode="HTML",
+        reply_markup=_receipt_keyboard(link),
+    )
+
+
+def _receipt_line(r: dict) -> str:
+    plan = PLANS.get(r["plan"], {}).get("title", r["plan"])
+    date_s = (r.get("created_at") or "")[:10]
+    head = f"№{r['id']} · {date_s} · {plan} · {r['amount'] / 100:.0f} ₽"
+    if r.get("url"):
+        return f'{head}\n   <a href="{_html_escape(r["url"])}">🧾 открыть чек</a>'
+    return f"{head}\n   ⏳ чек формируется"
+
+
+@dp.message(Command("receipts"))
+async def cmd_receipts(message: Message):
+    """Чеки пользователя (и очередь ручных чеков — для админа)."""
+    user_id = message.from_user.id
+    rows = get_user_receipts(user_id)
+    if rows:
+        text = "🧾 <b>Твои чеки</b>\n\n" + "\n\n".join(_receipt_line(r) for r in rows)
+    else:
+        text = "🧾 Оплат пока не было — чеков нет.\nТарифы: /buy"
+    if user_id == ADMIN_ID:
+        pending = get_pending_receipts()
+        if pending:
+            text += "\n\n🛠 <b>Ждут ручного чека:</b>\n" + "\n".join(
+                f"№{r['id']} · user <code>{r['user_id']}</code> · {r['amount'] / 100:.2f} ₽ · {r['plan']}"
+                for r in pending
+            ) + "\n\nДетали чека: /receipt НОМЕР"
+    await message.answer(text, parse_mode="HTML", link_preview_options=NO_PREVIEW)
+
+
+@dp.message(Command("receipt"))
+async def cmd_receipt(message: Message):
+    """Админ: /receipt 7 https://lknpd.nalog.ru/... — отдать покупателю ссылку на чек."""
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer("Формат: <code>/receipt НОМЕР ССЫЛКА</code>\nОчередь: /receipts", parse_mode="HTML")
+        return
+    receipt_no = int(parts[1])
+    if len(parts) == 2:
+        row = next((r for r in get_pending_receipts() if r["id"] == receipt_no), None)
+        if not row:
+            await message.answer(f"Чек №{receipt_no} не найден среди ожидающих.")
+            return
+        await message.answer(
+            NR.manual_instructions(receipt_no, row["plan"], row["amount"] / 100, row["created_at"][:16].replace("T", " ") + " UTC"),
+            parse_mode="HTML",
+        )
+        return
+    link = parts[2].strip()
+    if not NR.looks_like_receipt_url(link):
+        await message.answer("Это не похоже на ссылку на чек «Мой налог» (https://lknpd.nalog.ru/…).")
+        return
+    row = set_receipt_url(receipt_no, link)
+    if not row:
+        await message.answer(f"Чек №{receipt_no} не найден.")
+        return
+    try:
+        await _send_receipt_to_user(row["user_id"], link)
+        await message.answer(f"✅ Чек №{receipt_no} отправлен покупателю.")
+    except Exception:
+        logger.exception("Не удалось отправить чек пользователю %s", row["user_id"])
+        await message.answer(f"Чек №{receipt_no} сохранён, но отправить покупателю не удалось (он мог заблокировать бота).")
+
+
+# ─── Документы: оферта, политика, удаление данных ───────────────────────────
+
+async def _send_legal(message: Message, kind: str) -> None:
+    link = legal.url(kind)
+    if link:
+        await message.answer(
+            f"📄 <b>{_html_escape(legal.title(kind))}</b>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="Открыть документ", url=link),
+            ]]),
+        )
+        return
+    for chunk in legal.to_telegram_chunks(legal.render(kind)):
+        await message.answer(chunk, parse_mode="HTML")
+
+
+@dp.message(Command("terms"))
+async def cmd_terms(message: Message):
+    await _send_legal(message, "offer")
+
+
+@dp.message(Command("privacy"))
+async def cmd_privacy(message: Message):
+    await _send_legal(message, "privacy")
+
+
+@dp.message(Command("delete_me"))
+async def cmd_delete_me(message: Message):
+    await message.answer(
+        "🗑 <b>Удалить мои данные?</b>\n\n"
+        "Удалятся: себестоимость, налоговые настройки, показатели последнего отчёта, "
+        "отзывы и имя пользователя.\n"
+        "Останутся: сведения об оплатах и чеках (их нужно хранить по налоговому "
+        "законодательству) и срок доступа.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Да, удалить", callback_data="delete_me_yes"),
+            InlineKeyboardButton(text="Отмена", callback_data="delete_me_no"),
+        ]]),
+    )
+
+
+@dp.callback_query(F.data.in_({"delete_me_yes", "delete_me_no"}))
+async def callback_delete_me(callback: CallbackQuery):
+    await callback.answer()
+    if callback.data == "delete_me_no":
+        await callback.message.edit_text("Ок, ничего не удаляю.")
+        return
+    user_id = callback.from_user.id
+    delete_user_data(user_id)
+    _cost_state.pop(user_id, None)
+    _compare_state.pop(user_id, None)
+    logger.info("Пользователь %s удалил свои данные (/delete_me)", user_id)
+    await callback.message.edit_text("✅ Данные удалены.")
 
 
 # ─── Автооплата через кошелёк ЮMoney ────────────────────────────────────────
@@ -804,9 +998,11 @@ async def callback_ym_buy(callback: CallbackQuery):
         "1️⃣ Нажми «Оплатить» и заплати картой или кошельком ЮMoney.\n"
         "2️⃣ Доступ откроется автоматически в течение минуты.\n\n"
         "Если ничего не пришло — нажми «Я оплатил».\n"
-        "<i>Ссылка действует 48 часов.</i>",
+        "<i>Ссылка действует 48 часов.</i>\n\n"
+        f"<i>{legal.links_html()}</i>",
         parse_mode="HTML",
         reply_markup=_ym_pay_keyboard(url, plan["price_rub"]),
+        link_preview_options=NO_PREVIEW,
     )
 
 
@@ -2318,6 +2514,11 @@ async def main():
     logger.info("ADMIN_ID: %s", ADMIN_ID)
     if ym.enabled():
         asyncio.create_task(_yoomoney_poller())
+    try:
+        await legal.ensure_published()
+    except Exception as exc:
+        logger.warning("Оферта: не удалось опубликовать на telegra.ph (%s) — /terms покажет текст в чате", exc)
+    logger.info("Чеки «Мой налог»: %s", "автоматически" if NR.auto_enabled() else "вручную (/receipt)")
     await dp.start_polling(bot)
 
 
