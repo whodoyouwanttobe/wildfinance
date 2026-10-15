@@ -148,3 +148,20 @@ cp data/users.db ~/users_$(date +%F).db   # бэкап базы
 - **`Permission denied (publickey)`**: проверь `SSH_PRIVATE_KEY` и что публичный ключ лежит в
   `/home/deploy/.ssh/authorized_keys`.
 - **`Host key verification failed`**: пересоздай `SSH_KNOWN_HOSTS` через `ssh-keyscan`.
+
+## Кабинет по API (WB / Ozon)
+
+Ключи продавцов хранятся в базе зашифрованными. Ключ шифрования — `API_ENC_KEY` в `.env`
+на сервере. Без него команда /connect отвечает «скоро заработает».
+
+```bash
+cd /opt/wildfinance
+echo "API_ENC_KEY=$(openssl rand -base64 32 | tr '+/' '-_')" >> .env
+docker compose up -d
+```
+
+⚠️ Не меняй и не теряй `API_ENC_KEY`: без него сохранённые ключи не расшифровать
+(продавцам придётся подключаться заново). Сделай копию в менеджер паролей.
+
+Автоотчёт приходит подписчикам по вторникам–четвергам с 11:00 до 20:00 МСК
+(пока WB не сформировал отчёт за прошлую неделю, бот пробует раз в день).

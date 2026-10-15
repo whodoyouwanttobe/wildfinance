@@ -21,6 +21,7 @@ import pandas as pd
 
 from abc_analysis import render_abc
 from table_reader import read_table, to_num
+import fines as F
 
 
 # ─── Маппинг столбцов (Ozon отчёт по начислениям) ────────────────────────────
@@ -44,7 +45,8 @@ OPTIONAL = {
 # Категории услуг
 LOGISTICS_TYPES = (
     "обработка отправления", "drop-off", "обратная логистика",
-    "последняя миля", "магистральная логистика", "доставка",
+    "последняя миля", "магистральная логистика", "доставка", "логистика",
+    "выдача товара",
 )
 STORAGE_TYPES = ("хранение", "утилизация", "размещение")
 PENALTY_TYPES = (
@@ -339,6 +341,7 @@ def compute(filepath: str) -> dict:
     return {
         "marketplace": "Ozon",
         "rows": rows,
+        "fines": F.from_ozon(df),
         "доход": float(grouped["доход"].sum()),
         "логистика": float(grouped["логистика"].sum()),
         "хранение": float(grouped["хранение"].sum()),

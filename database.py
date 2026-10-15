@@ -34,7 +34,10 @@ _default_dir = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.getenv("DATA_DIR", _default_dir)
 DB_PATH = os.path.join(DATA_DIR, "users.db")
 
-FREE_TRIAL_DAYS = 7
+FREE_TRIAL_DAYS = 7          # устарело: раньше был пробный период по дням, оставлено для совместимости
+# Бесплатно — N собственных отчётов (по умолчанию 1), дальше — подписка.
+# Счётчик free_used не сбрасывается при /delete_me, чтобы бесплатный разбор не выдавался повторно.
+FREE_REPORTS = int(os.getenv("FREE_REPORTS", "1"))
 
 
 def get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
@@ -62,6 +65,12 @@ def get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
             conn.execute(alter)
         except sqlite3.OperationalError:
             pass  # столбец уже существует
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN free_used INTEGER DEFAULT 0")
+        # Переход с пробного периода по дням: кто уже присылал отчёты — бесплатный разбор получил
+        conn.execute("UPDATE users SET free_used = COALESCE(report_count, 0)")
+    except sqlite3.OperationalError:
+        pass
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS feedback (
@@ -162,6 +171,20 @@ def get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
             issued_at   TEXT DEFAULT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS api_tokens (
+            user_id     INTEGER NOT NULL,
+            marketplace TEXT NOT NULL,
+            secret      TEXT NOT NULL,
+            expires_at  TEXT DEFAULT NULL,
+            auto_weekly INTEGER DEFAULT 1,
+            created_at  TEXT NOT NULL,
+            last_ok_at  TEXT DEFAULT NULL,
+            last_error  TEXT DEFAULT '',
+            last_sent_week TEXT DEFAULT '',
+            PRIMARY KEY (user_id, marketplace)
+        )
+    """)
     conn.commit()
     return conn
 
@@ -188,33 +211,51 @@ def add_user(user_id: int, username: str | None = None, db_path: str = DB_PATH) 
         conn.close()
 
 
-def is_trial_active(user_id: int, db_path: str = DB_PATH) -> bool:
-    """
-    Проверяет, есть ли у пользователя доступ.
-    Приоритет: access_until (оплаченный) → триал (7 дней).
-    """
-    conn = get_connection(db_path)
+def has_paid_access(user_id: int, db_path: str | None = None) -> bool:
+    """Действует ли оплаченный (или выданный админом) доступ."""
+    conn = get_connection(db_path or DB_PATH)
     try:
-        cursor = conn.execute(
-            "SELECT join_date, access_until FROM users WHERE user_id = ?",
-            (user_id,),
-        )
-        row = cursor.fetchone()
-        if row is None:
-            return False
-
-        join_date_str, access_until_str = row
-
-        # Если есть оплаченный доступ — проверяем его
-        if access_until_str:
-            access_until = datetime.fromisoformat(access_until_str)
-            return datetime.utcnow() < access_until
-
-        # Иначе — стандартный 7-дневный триал
-        join_date = datetime.fromisoformat(join_date_str)
-        return datetime.utcnow() < join_date + timedelta(days=FREE_TRIAL_DAYS)
+        row = conn.execute("SELECT access_until FROM users WHERE user_id = ?", (user_id,)).fetchone()
     finally:
         conn.close()
+    if not row or not row[0]:
+        return False
+    try:
+        return datetime.utcnow() < datetime.fromisoformat(row[0])
+    except ValueError:
+        return False
+
+
+def free_reports_left(user_id: int, db_path: str | None = None) -> int:
+    """Сколько бесплатных разборов ещё осталось (без учёта оплаты)."""
+    conn = get_connection(db_path or DB_PATH)
+    try:
+        row = conn.execute("SELECT COALESCE(free_used, 0) FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return 0
+    return max(0, FREE_REPORTS - int(row[0] or 0))
+
+
+def use_free_report(user_id: int, db_path: str | None = None) -> None:
+    """Списывает бесплатный разбор (вызывать после успешного отчёта без оплаченного доступа)."""
+    conn = get_connection(db_path or DB_PATH)
+    try:
+        conn.execute("UPDATE users SET free_used = COALESCE(free_used, 0) + 1 WHERE user_id = ?", (user_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def is_trial_active(user_id: int, db_path: str | None = None) -> bool:
+    """
+    Можно ли разобрать новый отчёт: есть оплаченный доступ или остался бесплатный разбор.
+    (Название историческое — раньше был пробный период на 7 дней.)
+    """
+    if has_paid_access(user_id, db_path):
+        return True
+    return free_reports_left(user_id, db_path) > 0
 
 
 def get_user(user_id: int, db_path: str = DB_PATH) -> dict | None:
@@ -668,7 +709,12 @@ def delete_user_data(user_id: int, db_path: str = DB_PATH) -> None:
         conn.execute("DELETE FROM sales_daily WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM report_ranges WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM user_events WHERE user_id = ?", (user_id,))
-        conn.execute("UPDATE users SET username = NULL, source = '' WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM api_tokens WHERE user_id = ?", (user_id,))
+        conn.execute(
+            "UPDATE users SET username = NULL, source = '', last_seen = NULL, visits = 0, "
+            "actions = 0, report_count = 0 WHERE user_id = ?",
+            (user_id,),
+        )
         conn.commit()
     finally:
         conn.close()
@@ -694,8 +740,11 @@ def get_crm_rows(db_path: str | None = None) -> list[dict]:
     try:
         users = conn.execute(
             "SELECT user_id, username, source, join_date, report_count, access_until, "
-            "last_seen, visits, actions FROM users"
+            "last_seen, visits, actions, COALESCE(free_used, 0) FROM users"
         ).fetchall()
+        api: dict[int, list] = {}
+        for uid, mp in conn.execute("SELECT user_id, marketplace FROM api_tokens"):
+            api.setdefault(uid, []).append(mp)
         events: dict[int, dict] = {}
         for uid, ev, cnt, first, last in conn.execute(
             "SELECT user_id, event, COUNT(*), MIN(created_at), MAX(created_at) "
@@ -713,7 +762,7 @@ def get_crm_rows(db_path: str | None = None) -> list[dict]:
             )
         }
         rows = []
-        for uid, username, source, join_date, reports, access_until, last_seen, visits, actions in users:
+        for uid, username, source, join_date, reports, access_until, last_seen, visits, actions, free_used in users:
             cnt, total = paid.get(uid, (0, 0))
             rows.append({
                 "user_id": uid,
@@ -730,6 +779,8 @@ def get_crm_rows(db_path: str | None = None) -> list[dict]:
                 "last_seen": last_seen,
                 "visits": visits or 0,
                 "actions": actions or 0,
+                "free_used": free_used or 0,
+                "api": api.get(uid, []),
             })
         return rows
     finally:
@@ -762,5 +813,86 @@ def touch_user(user_id: int, username: str | None = None, db_path: str | None = 
             (now.isoformat(timespec="seconds"), int(new_visit), username or None, user_id),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+# ─── API-ключи маркетплейсов (хранятся зашифрованными, см. mp_api.py) ─────────
+
+def save_api_token(user_id: int, marketplace: str, secret: str, expires_at: str | None = None,
+                   db_path: str | None = None) -> None:
+    conn = get_connection(db_path or DB_PATH)
+    try:
+        conn.execute(
+            "INSERT INTO api_tokens (user_id, marketplace, secret, expires_at, auto_weekly, created_at, last_error) "
+            "VALUES (?, ?, ?, ?, 1, ?, '') "
+            "ON CONFLICT(user_id, marketplace) DO UPDATE SET secret = excluded.secret, "
+            "expires_at = excluded.expires_at, created_at = excluded.created_at, last_error = ''",
+            (user_id, marketplace, secret, expires_at, datetime.utcnow().isoformat(timespec="seconds")),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_api_token(user_id: int, marketplace: str, db_path: str | None = None) -> dict | None:
+    rows = list_api_tokens(user_id=user_id, db_path=db_path)
+    for r in rows:
+        if r["marketplace"] == marketplace:
+            return r
+    return None
+
+
+def list_api_tokens(user_id: int | None = None, db_path: str | None = None) -> list[dict]:
+    conn = get_connection(db_path or DB_PATH)
+    try:
+        sql = ("SELECT user_id, marketplace, secret, expires_at, auto_weekly, created_at, last_ok_at, "
+               "last_error, last_sent_week FROM api_tokens")
+        args: tuple = ()
+        if user_id is not None:
+            sql += " WHERE user_id = ?"
+            args = (user_id,)
+        keys = ("user_id", "marketplace", "secret", "expires_at", "auto_weekly", "created_at",
+                "last_ok_at", "last_error", "last_sent_week")
+        return [dict(zip(keys, row)) for row in conn.execute(sql + " ORDER BY user_id, marketplace", args)]
+    finally:
+        conn.close()
+
+
+def delete_api_token(user_id: int, marketplace: str | None = None, db_path: str | None = None) -> int:
+    conn = get_connection(db_path or DB_PATH)
+    try:
+        if marketplace:
+            cur = conn.execute("DELETE FROM api_tokens WHERE user_id = ? AND marketplace = ?", (user_id, marketplace))
+        else:
+            cur = conn.execute("DELETE FROM api_tokens WHERE user_id = ?", (user_id,))
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
+def update_api_token(user_id: int, marketplace: str, db_path: str | None = None, **fields) -> None:
+    allowed = {"auto_weekly", "last_ok_at", "last_error", "last_sent_week", "expires_at"}
+    sets = {k: v for k, v in fields.items() if k in allowed}
+    if not sets:
+        return
+    conn = get_connection(db_path or DB_PATH)
+    try:
+        conn.execute(
+            "UPDATE api_tokens SET " + ", ".join(f"{k} = ?" for k in sets) + " WHERE user_id = ? AND marketplace = ?",
+            (*sets.values(), user_id, marketplace),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def has_event(user_id: int, event: str, db_path: str | None = None) -> bool:
+    conn = get_connection(db_path or DB_PATH)
+    try:
+        return conn.execute(
+            "SELECT 1 FROM user_events WHERE user_id = ? AND event = ? LIMIT 1", (user_id, event)
+        ).fetchone() is not None
     finally:
         conn.close()

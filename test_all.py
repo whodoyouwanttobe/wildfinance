@@ -271,11 +271,11 @@ class TestDatabase:
         assert is_trial_active(11111, db_path=test_db) is True
 
     def test_trial_expired(self, test_db):
-        """Триал истекает через 7 дней."""
+        """Бесплатный разбор использован — нового отчёта без оплаты нет."""
         conn = get_connection(test_db)
         old_date = (datetime.utcnow() - timedelta(days=8)).isoformat()
         conn.execute(
-            "INSERT INTO users (user_id, username, join_date) VALUES (?, ?, ?)",
+            "INSERT INTO users (user_id, username, join_date, free_used) VALUES (?, ?, ?, 1)",
             (22222, "expired_user", old_date),
         )
         conn.commit()
@@ -284,7 +284,7 @@ class TestDatabase:
         assert is_trial_active(22222, db_path=test_db) is False
 
     def test_trial_active_on_day_6(self, test_db):
-        """Триал ещё активен на 6-й день."""
+        """Бесплатный разбор не зависит от даты регистрации."""
         conn = get_connection(test_db)
         recent_date = (datetime.utcnow() - timedelta(days=6)).isoformat()
         conn.execute(
@@ -299,6 +299,32 @@ class TestDatabase:
     def test_trial_inactive_for_unknown_user(self, test_db):
         """Триал неактивен для незарегистрированного пользователя."""
         assert is_trial_active(44444, db_path=test_db) is False
+
+    def test_free_report_used_once(self, test_db):
+        """Первый разбор бесплатный, после него — только по подписке; /delete_me не возвращает его."""
+        from database import free_reports_left, use_free_report, delete_user_data, has_paid_access
+        add_user(44445, "fr", db_path=test_db)
+        assert free_reports_left(44445, db_path=test_db) == 1
+        use_free_report(44445, db_path=test_db)
+        assert is_trial_active(44445, db_path=test_db) is False
+        delete_user_data(44445, db_path=test_db)
+        assert is_trial_active(44445, db_path=test_db) is False
+        grant_access(44445, 30, db_path=test_db)
+        assert has_paid_access(44445, db_path=test_db) and is_trial_active(44445, db_path=test_db)
+
+    def test_migration_counts_old_reports_as_free_used(self, tmp_path):
+        """Старые пользователи с отчётами при переходе считаются получившими бесплатный разбор."""
+        import sqlite3
+        from database import free_reports_left
+        path = str(tmp_path / "old.db")
+        c = sqlite3.connect(path)
+        c.execute("CREATE TABLE users (user_id INTEGER PRIMARY KEY, username TEXT, join_date TEXT NOT NULL, "
+                  "access_until TEXT DEFAULT NULL, report_count INTEGER DEFAULT 0)")
+        c.execute("INSERT INTO users VALUES (1, 'a', '2026-10-01', NULL, 2)")
+        c.execute("INSERT INTO users VALUES (2, 'b', '2026-10-01', NULL, 0)")
+        c.commit(); c.close()
+        assert free_reports_left(1, db_path=path) == 0
+        assert free_reports_left(2, db_path=path) == 1
 
     def test_table_created_automatically(self, test_db):
         """Таблицы users и feedback создаются автоматически."""
@@ -333,7 +359,7 @@ class TestDatabase:
         conn = get_connection(test_db)
         old_date = (datetime.utcnow() - timedelta(days=30)).isoformat()
         conn.execute(
-            "INSERT INTO users (user_id, username, join_date) VALUES (?, ?, ?)",
+            "INSERT INTO users (user_id, username, join_date, free_used) VALUES (?, ?, ?, 1)",
             (50002, "old_user", old_date),
         )
         conn.commit()
@@ -503,7 +529,7 @@ class TestIntegration:
         conn = get_connection(test_db)
         old_date = (datetime.utcnow() - timedelta(days=8)).isoformat()
         conn.execute(
-            "INSERT INTO users (user_id, username, join_date) VALUES (?, ?, ?)",
+            "INSERT INTO users (user_id, username, join_date, free_used) VALUES (?, ?, ?, 1)",
             (10002, "old_seller", old_date),
         )
         conn.commit()
@@ -517,7 +543,7 @@ class TestIntegration:
         conn = get_connection(test_db)
         old_date = (datetime.utcnow() - timedelta(days=30)).isoformat()
         conn.execute(
-            "INSERT INTO users (user_id, username, join_date) VALUES (?, ?, ?)",
+            "INSERT INTO users (user_id, username, join_date, free_used) VALUES (?, ?, ?, 1)",
             (10003, "paid_seller", old_date),
         )
         conn.commit()

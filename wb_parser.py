@@ -25,6 +25,7 @@ import pandas as pd
 
 from abc_analysis import render_abc
 from table_reader import read_table, to_num
+import fines as F
 
 # ─── Маппинг столбцов ───────────────────────────────────────────────────────
 
@@ -349,6 +350,7 @@ def compute(filepath: str) -> dict:
         "чистая_прибыль": float(чистая_прибыль),
         "grouped": grouped,
         "rows": _history_rows(df, DATE_COLUMNS),
+        "fines": F.from_wb(df),
     }
 
 

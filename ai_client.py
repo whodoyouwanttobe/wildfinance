@@ -339,6 +339,10 @@ class AIClient:
             prompt, system=system, max_tokens=max_tokens,
         )
 
+    async def ask(self, prompt: str, system: str = "", max_tokens: int = 700) -> str:
+        """Произвольный запрос (Tier 1 → дальше по цепочке)."""
+        return await self._ask_with_fallback(prompt, system=system, max_tokens=max_tokens)
+
     async def _ask_with_fallback(
         self,
         prompt: str,

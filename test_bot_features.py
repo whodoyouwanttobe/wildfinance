@@ -28,7 +28,7 @@ def db(tmp_path, monkeypatch):
                  "mark_pending_paid", "set_costs", "get_costs", "delete_cost", "get_tax",
                  "set_tax", "save_last_report", "get_last_report", "set_user_source",
                  "add_receipt", "set_receipt_url", "get_user_receipts", "get_pending_receipts",
-                 "delete_user_data"):
+                 "delete_user_data", "free_reports_left", "use_free_report", "has_event"):
         fn = getattr(database, name)
         monkeypatch.setattr(B, name, lambda *a, _fn=fn, **k: _fn(*a, db_path=path, **k))
     # history.py берёт путь из database.DB_PATH в момент вызова
@@ -157,6 +157,8 @@ async def test_problem_button_then_text_goes_to_admin(monkeypatch):
 @pytest.mark.asyncio
 async def test_compare_flow(db, monkeypatch):
     uid = 42
+    database.add_user(uid, "u", db_path=db)
+    database.extend_access(uid, 30, db_path=db)
     B._compare_state.pop(uid, None)
     await B.cmd_compare(_msg(uid, text="/compare"))
     assert uid in B._compare_state
@@ -185,6 +187,8 @@ async def test_compare_flow(db, monkeypatch):
 @pytest.mark.asyncio
 async def test_compare_mixed_marketplaces_shows_wb_vs_ozon(db, monkeypatch):
     uid = 43
+    database.add_user(uid, "u", db_path=db)
+    database.extend_access(uid, 30, db_path=db)
     await B.cmd_compare(_msg(uid, text="/compare"))
     files = iter([os.path.join(HERE, "wb_real_report.xlsx"), os.path.join(HERE, "ozon_real_report.xlsx")])
 
@@ -205,6 +209,8 @@ async def test_compare_mixed_marketplaces_shows_wb_vs_ozon(db, monkeypatch):
 @pytest.mark.asyncio
 async def test_wbozon_flow_any_order(db, monkeypatch):
     uid = 45
+    database.add_user(uid, "u", db_path=db)
+    database.extend_access(uid, 30, db_path=db)
     await B.cmd_wbozon(_msg(uid, text="/wbozon"))
     files = iter([os.path.join(HERE, "ozon_real_report.xlsx"), os.path.join(HERE, "ozon_real_report.xlsx"),
                   os.path.join(HERE, "wb_real_report.xlsx")])
@@ -286,7 +292,7 @@ async def test_successful_payment_grants_access_once(db, monkeypatch):
     uid = 77
     # Пользователь с давно истёкшим триалом
     conn = database.get_connection(db)
-    conn.execute("INSERT INTO users (user_id, username, join_date) VALUES (?, ?, ?)",
+    conn.execute("INSERT INTO users (user_id, username, join_date, free_used) VALUES (?, ?, ?, 1)",
                  (uid, "p", "2020-01-01T00:00:00"))
     conn.commit()
     conn.close()
@@ -339,7 +345,7 @@ async def test_buy_keyboard_uses_invoice_when_token(monkeypatch):
 async def test_stats(db):
     m = _msg(90)
     await B.cmd_stats(m)
-    assert "Пробный период до" in m.answer.call_args.args[0]
+    assert "Бесплатных разборов: 1" in m.answer.call_args.args[0]
 
 
 # ─── ЮMoney ─────────────────────────────────────────────────────────────────
@@ -389,6 +395,7 @@ async def test_ym_full_flow(db, monkeypatch):
         return "https://yoomoney.ru/transfer/quickpay?requestId=x"
     monkeypatch.setattr(ym, "create_payment_url", fake_url)
 
+    monkeypatch.setattr(B, "FOREVER_PROMO_UNTIL", "2099-01-01")   # акция «навсегда» в тесте ещё идёт
     uid = 555
     c = _cb(uid, "ym_forever")
     await B.callback_ym_buy(c)
@@ -457,7 +464,7 @@ def test_tariffs_text_switches_after_promo(monkeypatch):
     after = B.tariffs_text(_AFTER)
     assert "Навсегда" in before and str(B.PLANS["forever"]["price_rub"]) in before
     assert "до 11 октября" in before
-    assert "12 месяцев" in after and "Навсегда" not in after
+    assert "Год" in after and "Навсегда" not in after and "экономия" in after
 
 
 def test_buy_keyboard_after_promo(monkeypatch):
@@ -505,11 +512,11 @@ async def test_report_trial_user_sees_promo_and_inline_buttons(db, monkeypatch):
     assert not any(t == "Что дальше?" for t in texts)
     report_call = next(c for c in calls if "ОТЧЁТ OZON" in c.args[0] or "/buy" in c.args[0])
     full = "\n".join(t for t in texts)
-    assert "/buy" in full and "Пробный период" in full
+    assert "/buy" in full and "бесплатный разбор" in full
     last_report = [c for c in calls if c.kwargs.get("reply_markup") is not None][0]
     kb = last_report.kwargs["reply_markup"].inline_keyboard
-    assert kb[0][0].callback_data == "cost_menu" and kb[1][0].callback_data == "xyz"
-    assert kb[2][0].callback_data == "post_review"
+    assert kb[0][0].callback_data == "cost_menu" and kb[1][0].callback_data == "fines"
+    assert kb[2][0].callback_data == "xyz" and kb[3][0].callback_data == "post_review"
     assert report_call is not None
 
 
@@ -521,7 +528,7 @@ async def test_report_paid_user_no_promo(db, monkeypatch):
     calls = await _send_report(701, monkeypatch)
     full = "\n".join(c.args[0] for c in calls)
     assert "ОТЧЁТ OZON" in full
-    assert "/buy" not in full and "Пробный период" not in full
+    assert "/buy" not in full and "бесплатный разбор" not in full
 
 
 @pytest.mark.asyncio

@@ -68,6 +68,7 @@ def test_offer_key_terms(seller_env):
 def test_privacy_key_terms(seller_env):
     text = legal.render("privacy")
     for phrase in ("152-ФЗ", "Telegram ID", "/delete_me", "территории Российской Федерации",
+                   "18 лет", "не является трансграничной", "сравнения показателей",
                    "10 рабочих дней", "удаляются сразу после обработки"):
         assert phrase in text, phrase
 
@@ -308,6 +309,9 @@ def test_delete_user_data(tmp_path):
     assert database.get_tax(7, db_path=p)[0] is None
     assert database.get_last_report(7, db_path=p) is None
     assert database.get_user(7, db_path=p)["username"] is None
+    assert database.get_user(7, db_path=p)["report_count"] == 0
+    row = database.get_crm_rows(p)[0]
+    assert (row["last_seen"], row["visits"], row["actions"], row["source"]) == (None, 0, 0, "")
     assert database.get_payments_total(db_path=p)[0] == 1
     assert len(database.get_user_receipts(7, db_path=p)) == 1
 

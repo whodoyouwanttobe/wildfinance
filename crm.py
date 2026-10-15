@@ -46,6 +46,7 @@ def build_payload(db_path: str | None = None) -> dict:
     return {
         "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
         "bot": os.getenv("BOT_USERNAME", "@wildfinance_bot").lstrip("@"),
+        "admin_id": int(os.getenv("ADMIN_ID", "0") or 0),
         "users": rows,
     }
 

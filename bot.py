@@ -53,6 +53,14 @@ from aiogram.types import (
 from database import (
     add_user,
     is_trial_active,
+    free_reports_left,
+    use_free_report,
+    has_event,
+    save_api_token,
+    get_api_token,
+    list_api_tokens,
+    delete_api_token,
+    update_api_token,
     grant_access,
     increment_report_count,
     save_feedback,
@@ -87,6 +95,8 @@ import yoomoney_pay as ym
 import legal
 import nalog_receipts as NR
 import history as H
+import fines as FN
+import mp_api as MA
 import crm
 from wb_parser import analyze as wb_analyze
 from ozon_parser import analyze as ozon_analyze
@@ -114,13 +124,15 @@ CARD_DETAILS = os.getenv("CARD_DETAILS", "Сбербанк: 0000 0000 0000 0000 
 # Оплата проходит внутри Telegram, бот получает successful_payment и сам
 # выдаёт доступ — без вебхук-сервера и ручного /give_access.
 PAYMENT_PROVIDER_TOKEN = os.getenv("PAYMENT_PROVIDER_TOKEN", "")
-PRICE_MONTH_RUB = int(os.getenv("PRICE_MONTH_RUB", "1490"))
+PRICE_MONTH_RUB = int(os.getenv("PRICE_MONTH_RUB", "890"))
 # Стартовая акция: «навсегда» продаётся только до FOREVER_PROMO_UNTIL (включительно, по Москве).
 # После этой даты вместо «навсегда» показывается тариф на 12 месяцев (PRICE_YEAR_RUB).
 # Пустой FOREVER_PROMO_UNTIL — «навсегда» доступен без ограничения по сроку.
 PRICE_FOREVER_RUB = int(os.getenv("PRICE_FOREVER_RUB", "4990"))
 FOREVER_PROMO_UNTIL = os.getenv("FOREVER_PROMO_UNTIL", "2026-10-11").strip()
-PRICE_YEAR_RUB = int(os.getenv("PRICE_YEAR_RUB", "11900"))
+# Год = цена месяца × YEAR_PAID_MONTHS (по умолчанию 8 из 12 месяцев). PRICE_YEAR_RUB в .env перекрывает расчёт.
+YEAR_PAID_MONTHS = int(os.getenv("YEAR_PAID_MONTHS", "8"))
+PRICE_YEAR_RUB = int(os.getenv("PRICE_YEAR_RUB", "") or PRICE_MONTH_RUB * YEAR_PAID_MONTHS)
 PAYMENT_URL_YEAR = os.getenv("PAYMENT_URL_YEAR", "")
 # Чек по 54-ФЗ через ЮKassa (нужен, если в ЮKassa подключена онлайн-касса / «Чеки от ЮKassa»)
 YOOKASSA_SEND_RECEIPT = os.getenv("YOOKASSA_SEND_RECEIPT", "0") == "1"
@@ -212,21 +224,37 @@ def available_plans(now: datetime | None = None) -> list[str]:
     return ["month", "forever"] if forever_available(now) else ["month", "year"]
 
 
+def rub(n: float) -> str:
+    """7120 → «7 120»."""
+    return f"{round(n):,}".replace(",", "\u00a0")
+
+
+def year_savings() -> tuple[int, int]:
+    """(экономия в ₽, скидка в %) годового тарифа против 12 оплат по месяцу."""
+    full = PLANS["month"]["price_rub"] * 12
+    save = full - PLANS["year"]["price_rub"]
+    pct = round(save / full * 100) if full else 0
+    return max(save, 0), max(pct, 0)
+
+
 def plan_button_text(plan_key: str, now: datetime | None = None) -> str:
     price = PLANS[plan_key]["price_rub"]
     if plan_key == "month":
-        return f"💳 1 месяц — {price} ₽"
+        return f"💳 Месяц — {rub(price)} ₽"
     if plan_key == "forever":
         left = promo_days_left(now)
         tail = "" if left is None else (" · последний день" if left <= 0 else f" · ещё {left} {days_word(left)}")
         return f"🔥 Навсегда — {price} ₽{tail}"
-    return f"📅 12 месяцев — {price} ₽"
+    save, pct = year_savings()
+    if save > 0:
+        return f"📅 Год — {rub(price)} ₽ · −{pct}%, экономия {rub(save)} ₽"
+    return f"📅 Год — {rub(price)} ₽"
 
 
 def tariffs_text(now: datetime | None = None) -> str:
     """Описание тарифов для /buy и сообщения об окончании пробного периода."""
     m = PLANS["month"]["price_rub"]
-    parts = [f"🔹 <b>Месяц — {m} ₽</b>\n   30 дней доступа. Без автосписаний — продлеваешь сам."]
+    parts = [f"🔹 <b>Месяц — {rub(m)} ₽</b>\n   30 дней доступа. Без автосписаний — продлеваешь сам."]
     if forever_available(now):
         f = PLANS["forever"]["price_rub"]
         promo = promo_left_text(now)
@@ -237,11 +265,12 @@ def tariffs_text(now: datetime | None = None) -> str:
         )
     else:
         y = PLANS["year"]["price_rub"]
-        save = m * 12 - y
+        save, pct = year_savings()
         per_month = round(y / 12)
         parts.append(
-            f"📅 <b>12 месяцев — {y} ₽</b> (≈{per_month} ₽/мес)"
-            + (f"\n   Выгода {save} ₽ по сравнению с помесячной оплатой." if save > 0 else "")
+            f"📅 <b>Год — {rub(y)} ₽</b> (≈{per_month} ₽/мес)"
+            + (f"\n   Платишь как за {round(y / m) if m else 12} месяцев вместо 12: "
+               f"<b>экономия {rub(save)} ₽ (−{pct}%)</b>." if save > 0 else "")
         )
     return "\n\n".join(parts)
 
@@ -263,16 +292,19 @@ def report_promo_footer(user_id: int, now: datetime | None = None) -> str:
     if has_paid_access(user_id):
         return ""
     lines = ["", "➖➖➖➖➖➖➖➖➖➖➖➖"]
-    u = get_user(user_id) or {}
-    try:
-        from database import FREE_TRIAL_DAYS
-        trial_end = datetime.fromisoformat(u["join_date"]) + timedelta(days=FREE_TRIAL_DAYS)
-        left = (trial_end - datetime.utcnow()).days
-        if left >= 0:
-            lines.append(f"🆓 Пробный период: осталось {left} {days_word(left)}." if left else "🆓 Пробный период заканчивается сегодня.")
-    except (KeyError, TypeError, ValueError):
-        pass
-    lines.append(f"💎 Полный доступ — от {PLANS['month']['price_rub']} ₽/мес → /buy")
+    left = free_reports_left(user_id)
+    if left <= 1:
+        lines.append("🆓 Это твой бесплатный разбор.")
+    else:
+        lines.append(f"🆓 Бесплатных разборов осталось: {left - 1}.")
+    lines.append(
+        "Дальше по подписке: новые отчёты каждую неделю, сравнение периодов, WB против Ozon, "
+        "автоотчёт из кабинета по API."
+    )
+    lines.append(f"💎 Месяц — {rub(PLANS['month']['price_rub'])} ₽ → /buy")
+    save, pct = year_savings()
+    if save > 0 and not forever_available(now):
+        lines.append(f"📅 Год — {rub(PLANS['year']['price_rub'])} ₽ (экономия {rub(save)} ₽, −{pct}%)")
     if forever_available(now):
         promo = promo_left_text(now)
         lines.append(
@@ -320,7 +352,7 @@ dp.callback_query.outer_middleware(_activity_middleware)
 
 WELCOME_TEXT = (
     "👋 <b>Привет! Я экспресс-аудитор отчётов Wildberries и Ozon.</b>\n\n"
-    "У тебя есть <b>7 дней бесплатного доступа</b>.\n\n"
+    "🆓 <b>Первый разбор — бесплатно.</b>\n\n"
     "📄 Отправь мне еженедельный детализированный отчет "
     "(Excel или CSV), и я за секунду посчитаю:\n\n"
     "  💰 Реальную чистую прибыль\n"
@@ -328,9 +360,10 @@ WELCOME_TEXT = (
     "  ⚠️ ТОП убыточных товаров\n"
     "  🔤 ABC-анализ ассортимента\n"
     "  💡 Рекомендации по оптимизации\n\n"
+    "🔒 Доступ к кабинету не нужен. Файл удаляется сразу после разбора.\n\n"
     "💡 <b>Хочешь сначала посмотреть, как это работает?</b>\n"
     "Нажми кнопку <b>«📊 Получить пример отчёта»</b> внизу —\n"
-    "я пришлю готовый файл, который можно сразу загрузить обратно.\n\n"
+    "сразу пришлю разбор реалистичного отчёта.\n\n"
     "Команды:\n"
     "  /compare — сравнить два отчёта (было → стало)\n"
     "  /buy — тарифы и оплата\n"
@@ -338,9 +371,21 @@ WELCOME_TEXT = (
     "<i>Пользуясь ботом, вы соглашаетесь с /terms и /privacy.</i>"
 )
 
+def paid_only_text() -> str:
+    return (
+        "🔒 <b>Это доступно по подписке.</b>\n\n"
+        "Бесплатно — один разбор отчёта. По подписке — сравнение недель, WB против Ozon, "
+        "любые новые отчёты и автоотчёт из кабинета по API.\n\n"
+        + tariffs_text()
+        + "\n\nВыбери тариф 👇"
+    )
+
+
 def trial_expired_text() -> str:
     return (
-        "⏱ <b>Бесплатный период закончился.</b>\n\n"
+        "🆓 <b>Бесплатный разбор уже использован.</b>\n\n"
+        "По подписке — любые отчёты WB и Ozon, сравнение недель, WB против Ozon, "
+        "штрафы с текстом обращения и автоотчёт из кабинета по API.\n\n"
         "Получи полный доступ:\n\n"
         + tariffs_text()
         + "\n\nВыбери тариф 👇"
@@ -363,6 +408,9 @@ HELP_TEXT = (
     "  /cost — себестоимость товаров (для расчёта прибыли)\n"
     "  /tax — система налогообложения\n"
     "  /xyz — матрица ABC × XYZ по истории отчётов\n"
+    "  /fines — штрафы и удержания + текст обращения в поддержку\n"
+    "  /connect — подключить кабинет WB/Ozon по API (отчёт без скачивания)\n"
+    "  /disconnect — отключить кабинет\n"
     "  /ai — AI-разбор последнего отчёта\n"
     "  /buy — тарифы и оплата\n"
     "  /receipts — мои чеки об оплате\n"
@@ -449,7 +497,7 @@ def get_main_keyboard() -> ReplyKeyboardMarkup:
                 KeyboardButton(text="💳 Оплатить доступ"),
                 KeyboardButton(text="🎁 Пригласить друга"),
             ],
-            [KeyboardButton(text="📄 Помощь")],
+            [KeyboardButton(text="🔌 Кабинет по API"), KeyboardButton(text="📄 Помощь")],
         ],
         resize_keyboard=True,
     )
@@ -511,7 +559,7 @@ def get_feedback_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def get_post_report_keyboard() -> InlineKeyboardMarkup:
+def get_post_report_keyboard(has_fines: bool = False, offer_api: bool = False) -> InlineKeyboardMarkup:
     """
     Кнопки, которые показываются ПОД каждым отчётом:
       - ⭐ Оставить отзыв — сразу открывает клавиатуру выбора звёзд
@@ -527,6 +575,7 @@ def get_post_report_keyboard() -> InlineKeyboardMarkup:
                 callback_data="cost_menu",
             ),
         ],
+        *([[InlineKeyboardButton(text="🔍 Штрафы и удержания", callback_data="fines")]] if has_fines else []),
         [
             InlineKeyboardButton(
                 text="📈 ABC × XYZ (по неделям)",
@@ -553,6 +602,8 @@ def get_post_report_keyboard() -> InlineKeyboardMarkup:
                 callback_data="post_repeat",
             ),
         ],
+        *([[InlineKeyboardButton(text="🔌 Получать отчёт сам — подключить кабинет", callback_data="api_menu")]]
+          if offer_api else []),
     ])
 
 
@@ -566,6 +617,43 @@ def _event(user_id: int, event: str) -> None:
         log_event(user_id, event)
     except Exception:
         logger.exception("Не удалось записать событие %s для %s", event, user_id)
+
+
+async def notify_admin(text: str) -> None:
+    """Сообщение админу (новые пользователи, первые отчёты, подключение API). Ошибки глушим."""
+    if not ADMIN_ID:
+        return
+    try:
+        await bot.send_message(ADMIN_ID, text, parse_mode="HTML",
+                               link_preview_options=LinkPreviewOptions(is_disabled=True))
+    except Exception:
+        logger.exception("Не удалось отправить уведомление админу")
+
+
+def _who(user_id: int, username: str | None = None) -> str:
+    """«@name (id)» для уведомлений админу."""
+    if username is None:
+        username = (get_user(user_id) or {}).get("username") or ""
+    name = f"@{_html_escape(username)}" if username else "без username"
+    return f"{name} (<code>{user_id}</code>)"
+
+
+def describe_source(source: str) -> str:
+    """Человеческое описание метки ссылки ?start=…"""
+    if not source:
+        return "без метки — поиск или общая ссылка на бота"
+    if source == "channel":
+        return "📣 канал (channel)"
+    if source.startswith("ref_"):
+        ref = source[4:]
+        if ref.isdigit():
+            return f"🎁 реферальная ссылка от {_who(int(ref))}"
+        return f"🎁 реферальная ссылка ({_html_escape(ref)})"
+    if source.startswith("u_"):
+        return f"👤 личная ссылка из переписки ({_html_escape(source)})"
+    if source.startswith("p_"):
+        return f"🤝 ссылка партнёра {_html_escape(source[2:])}"
+    return f"🏷 метка «{_html_escape(source)}»"
 
 
 def _parse_start_source(text: str) -> str:
@@ -585,6 +673,12 @@ async def cmd_start(message: Message):
 
     is_new = add_user(user_id, username)
     source = _parse_start_source(message.text if isinstance(message.text, str) else "")
+    first_time_link = False
+    if source and not is_new:
+        try:
+            first_time_link = not has_event(user_id, f"start:{source}")
+        except Exception:
+            logger.exception("Не удалось проверить события %s", user_id)
     _event(user_id, f"start:{source}" if source else "start")
     if is_new:
         logger.info("Новый пользователь: %s (@%s), источник: %s", user_id, username, source or "—")
@@ -593,6 +687,14 @@ async def cmd_start(message: Message):
                 set_user_source(user_id, source)
             except Exception:
                 logger.exception("Не удалось сохранить источник для %s", user_id)
+        await notify_admin(
+            f"🆕 <b>Новый пользователь</b> {_who(user_id, username)}\n"
+            f"Откуда: {describe_source(source)}"
+        )
+    elif first_time_link:
+        await notify_admin(
+            f"🔁 {_who(user_id, username)} впервые перешёл по ссылке: {describe_source(source)}"
+        )
 
     await message.answer(WELCOME_TEXT, parse_mode="HTML", reply_markup=get_main_keyboard())
 
@@ -967,6 +1069,7 @@ async def _send_legal(message: Message, kind: str) -> None:
 
 
 @dp.message(Command("terms"))
+@dp.message(Command("offer"))
 async def cmd_terms(message: Message):
     await _send_legal(message, "offer")
 
@@ -980,10 +1083,11 @@ async def cmd_privacy(message: Message):
 async def cmd_delete_me(message: Message):
     await message.answer(
         "🗑 <b>Удалить мои данные?</b>\n\n"
-        "Удалятся: себестоимость, налоговые настройки, показатели и история отчётов, "
-        "отзывы и имя пользователя.\n"
-        "Останутся: сведения об оплатах и чеках (их нужно хранить по налоговому "
-        "законодательству) и срок доступа.",
+        "Удалятся: себестоимость, налоговые настройки, показатели и история отчётов, история действий, "
+        "отзывы, имя пользователя и подключённые API-ключи маркетплейсов.\n"
+        "Останутся: Telegram ID, срок доступа, отметка об использованном бесплатном разборе "
+        "и сведения об оплатах и чеках "
+        "(их нужно хранить по налоговому законодательству).",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="Да, удалить", callback_data="delete_me_yes"),
@@ -1002,6 +1106,7 @@ async def callback_delete_me(callback: CallbackQuery):
     delete_user_data(user_id)
     _cost_state.pop(user_id, None)
     _compare_state.pop(user_id, None)
+    _api_state.pop(user_id, None)
     logger.info("Пользователь %s удалил свои данные (/delete_me)", user_id)
     await callback.message.edit_text("✅ Данные удалены.")
 
@@ -1115,6 +1220,115 @@ async def cmd_paysupport(message: Message):
         "Отправьте /cancel, чтобы выйти.",
         parse_mode="HTML",
     )
+
+
+# ─── Штрафы и удержания, обращение в поддержку ──────────────────────────────
+
+AI_FAIL_PREFIX = "🤖 AI-анализ временно недоступен"
+
+
+def _fines_of(user_id: int) -> tuple[list[dict], str]:
+    snap = get_last_report(user_id) or {}
+    return snap.get("fines") or [], snap.get("marketplace", "WB")
+
+
+def get_fines_keyboard(has_penalties: bool) -> InlineKeyboardMarkup:
+    rows = []
+    if has_penalties:
+        rows.append([InlineKeyboardButton(text="📝 Текст обращения в поддержку", callback_data="fines_appeal")])
+    rows.append([InlineKeyboardButton(text="📎 Список в Excel", callback_data="fines_xlsx")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _send_fines(message: Message, user_id: int) -> None:
+    items, mp = _fines_of(user_id)
+    if not get_last_report(user_id):
+        await message.answer("Сначала пришли отчёт — расшифрую в нём штрафы и удержания.")
+        return
+    has_pen = any(i["kind"] == "Штраф" for i in items)
+    chunks = split_text(FN.render(items, mp), max_len=4000)
+    for i, chunk in enumerate(chunks):
+        last = i == len(chunks) - 1
+        await message.answer(
+            chunk, parse_mode="HTML",
+            reply_markup=get_fines_keyboard(has_pen) if (last and items) else None,
+        )
+
+
+@dp.message(Command("fines"))
+async def cmd_fines(message: Message):
+    _event(message.from_user.id, "fines")
+    await _send_fines(message, message.from_user.id)
+
+
+@dp.callback_query(F.data == "fines")
+async def callback_fines(callback: CallbackQuery):
+    await callback.answer()
+    _event(callback.from_user.id, "fines")
+    await _send_fines(callback.message, callback.from_user.id)
+
+
+async def _appeal_text(penalties: list[dict], mp: str) -> tuple[str, bool]:
+    """(текст, сделан_ли_AI). При любой проблеме с AI — шаблон."""
+    ai = get_ai_client()
+    if ai.available:
+        try:
+            system, prompt = FN.appeal_prompt(penalties, mp)
+            text = (await ai.ask(prompt, system=system, max_tokens=700)).strip()
+            if text and not text.startswith(AI_FAIL_PREFIX):
+                return FN.trim(text), True
+        except Exception:
+            logger.exception("AI: не удалось составить обращение")
+    return FN.appeal_template(penalties, mp), False
+
+
+@dp.callback_query(F.data == "fines_appeal")
+async def callback_fines_appeal(callback: CallbackQuery):
+    await callback.answer()
+    user_id = callback.from_user.id
+    items, mp = _fines_of(user_id)
+    penalties = [i for i in items if i["kind"] == "Штраф"]
+    if not penalties:
+        await callback.message.answer("В последнем отчёте нет штрафов — оспаривать нечего 🙂")
+        return
+    _event(user_id, "fines_appeal")
+    wait = await callback.message.answer("📝 Составляю обращение… ⏳")
+    text, by_ai = await _appeal_text(penalties, mp)
+    where = "поддержку Wildberries (раздел «Обращения»)" if mp == "WB" else "поддержку Ozon"
+    try:
+        await wait.delete()
+    except Exception:
+        pass
+    await callback.message.answer(
+        f"📝 <b>Текст обращения</b> — скопируй и отправь в {where}:\n\n"
+        f"<pre>{_html_escape(text)}</pre>\n"
+        f"<i>{len(text)} символов. Проверь даты и суммы перед отправкой. "
+        "Решение о возврате принимает маркетплейс — бот его не гарантирует.</i>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="📎 Список штрафов в Excel (приложить)", callback_data="fines_xlsx"),
+        ]]),
+    )
+
+
+@dp.callback_query(F.data == "fines_xlsx")
+async def callback_fines_xlsx(callback: CallbackQuery):
+    await callback.answer()
+    items, mp = _fines_of(callback.from_user.id)
+    if not items:
+        await callback.message.answer("В последнем отчёте нет штрафов и удержаний.")
+        return
+    path = FN.to_excel(items, mp)
+    try:
+        await callback.message.answer_document(
+            FSInputFile(path, filename=f"штрафы_и_удержания_{mp}.xlsx"),
+            caption="📎 Все штрафы и удержания из последнего отчёта — можно приложить к обращению.",
+        )
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 # ─── История продаж и ABC × XYZ ─────────────────────────────────────────────
@@ -1307,16 +1521,13 @@ async def cmd_stats(message: Message):
     add_user(user_id, message.from_user.username or "")
     u = get_user(user_id) or {}
     active = is_trial_active(user_id)
-    if u.get("access_until"):
-        status = f"💎 Оплачен до {u['access_until'][:10]}" if active else "⏱ Оплаченный доступ закончился"
+    if has_paid_access(user_id):
+        status = f"💎 Доступ оплачен до {u['access_until'][:10]}"
+    elif u.get("access_until"):
+        status = "⏱ Оплаченный доступ закончился"
     else:
-        from datetime import datetime, timedelta
-        from database import FREE_TRIAL_DAYS
-        try:
-            end = datetime.fromisoformat(u["join_date"]) + timedelta(days=FREE_TRIAL_DAYS)
-            status = f"🆓 Пробный период до {end:%Y-%m-%d}" if active else "⏱ Пробный период закончился"
-        except (KeyError, TypeError, ValueError):
-            status = "🆓 Пробный период"
+        left = free_reports_left(user_id)
+        status = f"🆓 Бесплатных разборов: {left}" if left else "🆓 Бесплатный разбор использован"
     text = (
         "📈 <b>Твоя статистика</b>\n\n"
         f"{status}\n"
@@ -1334,7 +1545,7 @@ async def cmd_invite(message: Message):
     name = me.username if me and getattr(me, "username", None) else "wildfinance_bot"
     link = f"https://t.me/{name}?start=ref_{message.from_user.id}"
     await message.answer(
-        "🎁 Поделись ботом с другом-селлером — у него будет 7 дней бесплатно:\n\n"
+        "🎁 Поделись ботом с другом-селлером — первый разбор у него бесплатный:\n\n"
         f"{link}",
     )
 
@@ -1567,6 +1778,113 @@ _last_compare: dict[int, dict] = {}
 _last_reports: dict[int, dict] = {}
 
 
+class _ChatTarget:
+    """Минимальная замена Message для отчётов без входящего сообщения (автоотчёт по API)."""
+
+    def __init__(self, chat_id: int):
+        self.chat_id = chat_id
+
+    async def answer(self, text, **kw):
+        return await bot.send_message(self.chat_id, text, **kw)
+
+    async def answer_document(self, document, **kw):
+        return await bot.send_document(self.chat_id, document, **kw)
+
+
+async def _process_report(message, user_id: int, tmp_path: str, file_name: str, processing_msg=None,
+                          source: str = "file") -> None:
+    """Разбор отчёта (файл из чата или выгрузка по API) и отправка результата пользователю."""
+    # Анализируем в отдельном потоке, чтобы не блокировать event loop
+    result, metrics = await asyncio.to_thread(analyze_full, tmp_path)
+    marketplace = metrics.get("marketplace", "?")
+    logger.info("Маркетплейс=%s, файл='%s', user=%s", marketplace, file_name, user_id)
+
+    # Снимок по артикулам — для ввода себестоимости (живёт в БД, переживает перезапуск)
+    snapshot = None
+    try:
+        snapshot = P.snapshot_from_metrics(metrics)
+        snapshot["fines"] = (metrics.get("fines") or [])[:FN.MAX_STORED]
+        save_last_report(user_id, snapshot, file_name)
+    except Exception:
+        logger.exception("Не удалось сохранить снимок отчёта для %s", user_id)
+
+    # История продаж по дням → XYZ-анализ, когда накопится MIN_WEEKS полных недель
+    history_line = ""
+    try:
+        hist = await asyncio.to_thread(H.save_report, user_id, metrics)
+        history_line = _history_line(hist)
+    except Exception:
+        logger.exception("Не удалось сохранить историю продаж для %s", user_id)
+
+    # Удаляем «анализирую...»
+    try:
+        await processing_msg.delete()
+    except Exception:
+        pass
+
+    # Отправляем результат (HTML). Кнопки действий — прямо под последней частью
+    # отчёта (без отдельного сообщения «Что дальше?»), реклама тарифов — только
+    # тем, у кого нет оплаченного доступа.
+    fine_items = metrics.get("fines") or []
+    offer_api = False
+    if source != "api" and MA.enabled():
+        try:
+            offer_api = not list_api_tokens(user_id=user_id)
+        except Exception:
+            offer_api = False
+    shown = result + FN.summary_line(fine_items) + history_line + report_promo_footer(user_id)
+    chunks = split_text(shown, max_len=4000)
+    for i, chunk in enumerate(chunks):
+        await message.answer(
+            chunk,
+            parse_mode="HTML",
+            reply_markup=get_post_report_keyboard(bool(fine_items), offer_api) if i == len(chunks) - 1 else None,
+        )
+
+    # Если себестоимость уже известна — сразу показываем настоящую прибыль
+    if snapshot and get_costs(user_id, snapshot["marketplace"]):
+        await _send_profit(message, user_id)
+
+    # Запоминаем имя файла, чтобы привязать возможную жалобу к отчёту
+    _last_file_name[user_id] = file_name
+
+    # Сохраняем результат последнего отчёта (для AI-кнопки и сравнений)
+    _last_reports[user_id] = {
+        "text": result,
+        "marketplace": marketplace if marketplace != "?" else "WB",
+        "file_name": file_name,
+        "timestamp": __import__("time").time(),
+    }
+
+    # Увеличиваем счётчик отчётов; без подписки — списываем бесплатный разбор
+    paid = has_paid_access(user_id)
+    if not paid:
+        use_free_report(user_id)
+    report_num = increment_report_count(user_id)
+    mp_tag = marketplace if marketplace in ("WB", "Ozon") else "другое"
+    _event(user_id, f"report:{mp_tag}")
+    if source == "api":
+        _event(user_id, f"report_api:{mp_tag}")
+    logger.info("Отчёт #%s отправлен пользователю %s", report_num, user_id)
+    if report_num == 1:
+        await notify_admin(
+            f"📊 <b>Первый отчёт</b> от {_who(user_id)}: {mp_tag}"
+            + (" (по API)" if source == "api" else "")
+            + ("" if paid else " — бесплатный разбор. Самое время написать и спросить, сошлись ли цифры.")
+        )
+
+    # После первого отчёта — запрос обратной связи
+    if report_num == 1 and not has_given_feedback(user_id):
+        await asyncio.sleep(1)  # Пауза чтобы пользователь увидел отчёт
+        await message.answer(
+            "🙏 <b>Это был ваш первый отчёт!</b>\n\n"
+            "Помогите мне стать лучше — оцените результат.\n"
+            "Сколько звёзд вы поставите?",
+            parse_mode="HTML",
+            reply_markup=get_feedback_keyboard(),
+        )
+
+
 @dp.message(F.document)
 async def handle_document(message: Message):
     """Обработчик входящих файлов (.xlsx, .xls, .csv)."""
@@ -1575,11 +1893,6 @@ async def handle_document(message: Message):
 
     # Регистрируем пользователя, если ещё не в БД
     add_user(user_id, username)
-
-    # Проверяем доступ (триал или оплаченный)
-    if not is_trial_active(user_id):
-        await message.answer(trial_expired_text(), parse_mode="HTML", reply_markup=get_buy_keyboard())
-        return
 
     # Файл с себестоимостью (наш шаблон) — сохраняем цены, а не анализируем как отчёт
     if (_cost_state.get(user_id, {}).get("mode") == "file"
@@ -1618,7 +1931,8 @@ async def handle_document(message: Message):
     try:
         processing_msg = await message.answer(
             "⏳ Анализирую отчёт...\n"
-            "Обычно это занимает 5–15 секунд."
+            "Обычно это занимает 5–15 секунд.\n"
+            "🔒 Файл удалится сразу после разбора."
         )
 
         with tempfile.NamedTemporaryFile(
@@ -1653,75 +1967,18 @@ async def handle_document(message: Message):
                 )
             return
 
-        # Анализируем в отдельном потоке, чтобы не блокировать event loop
-        result, metrics = await asyncio.to_thread(analyze_full, tmp_path)
-        marketplace = metrics.get("marketplace", "?")
-        logger.info("Маркетплейс=%s, файл='%s', user=%s", marketplace, file_name, user_id)
+        # Доступ: оплаченная подписка или бесплатный разбор (проверяем после файла-примера —
+        # пример и себестоимость доступны всем)
+        if not is_trial_active(user_id):
+            try:
+                await processing_msg.delete()
+            except Exception:
+                pass
+            _event(user_id, "paywall")
+            await message.answer(trial_expired_text(), parse_mode="HTML", reply_markup=get_buy_keyboard())
+            return
 
-        # Снимок по артикулам — для ввода себестоимости (живёт в БД, переживает перезапуск)
-        snapshot = None
-        try:
-            snapshot = P.snapshot_from_metrics(metrics)
-            save_last_report(user_id, snapshot, file_name)
-        except Exception:
-            logger.exception("Не удалось сохранить снимок отчёта для %s", user_id)
-
-        # История продаж по дням → XYZ-анализ, когда накопится MIN_WEEKS полных недель
-        history_line = ""
-        try:
-            hist = await asyncio.to_thread(H.save_report, user_id, metrics)
-            history_line = _history_line(hist)
-        except Exception:
-            logger.exception("Не удалось сохранить историю продаж для %s", user_id)
-
-        # Удаляем «анализирую...»
-        try:
-            await processing_msg.delete()
-        except Exception:
-            pass
-
-        # Отправляем результат (HTML). Кнопки действий — прямо под последней частью
-        # отчёта (без отдельного сообщения «Что дальше?»), реклама тарифов — только
-        # тем, у кого нет оплаченного доступа.
-        shown = result + history_line + report_promo_footer(user_id)
-        chunks = split_text(shown, max_len=4000)
-        for i, chunk in enumerate(chunks):
-            await message.answer(
-                chunk,
-                parse_mode="HTML",
-                reply_markup=get_post_report_keyboard() if i == len(chunks) - 1 else None,
-            )
-
-        # Если себестоимость уже известна — сразу показываем настоящую прибыль
-        if snapshot and get_costs(user_id, snapshot["marketplace"]):
-            await _send_profit(message, user_id)
-
-        # Запоминаем имя файла, чтобы привязать возможную жалобу к отчёту
-        _last_file_name[user_id] = file_name
-
-        # Сохраняем результат последнего отчёта (для AI-кнопки и сравнений)
-        _last_reports[user_id] = {
-            "text": result,
-            "marketplace": marketplace if marketplace != "?" else "WB",
-            "file_name": file_name,
-            "timestamp": __import__("time").time(),
-        }
-
-        # Увеличиваем счётчик отчётов
-        report_num = increment_report_count(user_id)
-        _event(user_id, f"report:{marketplace if marketplace in ('WB', 'Ozon') else 'другое'}")
-        logger.info("Отчёт #%s отправлен пользователю %s", report_num, user_id)
-
-        # После первого отчёта — запрос обратной связи
-        if report_num == 1 and not has_given_feedback(user_id):
-            await asyncio.sleep(1)  # Пауза чтобы пользователь увидел отчёт
-            await message.answer(
-                "🙏 <b>Это был ваш первый отчёт!</b>\n\n"
-                "Помогите мне стать лучше — оцените результат.\n"
-                "Сколько звёзд вы поставите?",
-                parse_mode="HTML",
-                reply_markup=get_feedback_keyboard(),
-            )
+        await _process_report(message, user_id, tmp_path, file_name, processing_msg)
 
     except asyncio.TimeoutError:
         logger.warning("Timeout для пользователя %s, файл: %s", user_id, file_name)
@@ -1773,20 +2030,8 @@ async def handle_document(message: Message):
                     admin_text,
                     parse_mode="HTML",
                 )
-                # Пересылаем сам файл как документ (если остался на диске)
-                if tmp_path and os.path.exists(tmp_path):
-                    try:
-                        await bot.send_document(
-                            ADMIN_ID,
-                            FSInputFile(tmp_path, filename=file_name or "report"),
-                            caption=(
-                                f"📎 Копия файла от @{username} "
-                                f"(<code>{user_id}</code>)"
-                            ),
-                            parse_mode="HTML",
-                        )
-                    except Exception as send_err:
-                        logger.warning("Не удалось переслать файл админу: %s", send_err)
+                # Сам файл админу НЕ пересылаем: обещаем пользователю, что файл удаляется
+                # сразу после разбора. Если нужен файл для отладки — попросить у пользователя.
                 logger.info("Админ уведомлён об ошибке для user=%s", user_id)
             except Exception as notify_err:
                 logger.error("Не удалось уведомить админа: %s", notify_err)
@@ -1801,6 +2046,319 @@ async def handle_document(message: Message):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# КАБИНЕТ ПО API: /connect, отчёт за прошлую неделю, еженедельный автоотчёт
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Ждём от пользователя ключ: {user_id: "WB" | "Ozon"}
+_api_state: dict[int, str] = {}
+# Попытки автоотчёта: (user_id, mp, неделя, день) — чтобы не дёргать API чаще раза в день
+_auto_attempts: set[tuple] = set()
+
+# Автоотчёт: дни недели (0 = пн) и часы по Москве, когда пробуем забрать отчёт за прошлую неделю.
+# WB формирует недельный отчёт в пн–вт, поэтому начинаем со вторника.
+AUTO_REPORT_WEEKDAYS = (1, 2, 3)
+AUTO_REPORT_HOURS = (11, 20)
+
+WB_API_HOWTO = (
+    "🔌 <b>Подключение Wildberries</b>\n\n"
+    "1. Кабинет WB → профиль → <b>Настройки → Доступ к API</b> "
+    "(в новом кабинете — «Интеграции по API» → «Создать токен»).\n"
+    "2. Тип токена — <b>Базовый</b> (если спросит), категория — <b>«Финансы»</b>, "
+    "отметь <b>«Только на чтение»</b>.\n"
+    "3. Скопируй токен и пришли его сюда одним сообщением.\n\n"
+    "🔒 С таким токеном нельзя ничего изменить в кабинете — только прочитать финансовый отчёт. "
+    "Я удалю сообщение с токеном из чата и сохраню его в зашифрованном виде. "
+    "Отключить в любой момент — /disconnect.\n\n"
+    "/cancel — передумал"
+)
+OZON_API_HOWTO = (
+    "🔌 <b>Подключение Ozon</b>\n\n"
+    "1. Кабинет Ozon → <b>Настройки → Seller API</b> → «Сгенерировать ключ».\n"
+    "2. Роль — <b>Admin read only</b> (только чтение).\n"
+    "3. Пришли сюда одним сообщением <b>Client ID</b> и <b>API-ключ</b> — через пробел или с новой строки.\n\n"
+    "🔒 Ключ «только для чтения» не даёт ничего менять в кабинете. "
+    "Я удалю сообщение с ключом из чата и сохраню его в зашифрованном виде. "
+    "Отключить в любой момент — /disconnect.\n\n"
+    "/cancel — передумал"
+)
+
+
+def _api_rows(user_id: int) -> dict:
+    try:
+        return {r["marketplace"]: r for r in list_api_tokens(user_id=user_id)}
+    except Exception:
+        logger.exception("Не удалось прочитать API-ключи %s", user_id)
+        return {}
+
+
+def get_connect_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    rows_db = _api_rows(user_id)
+    kb = []
+    for mp in ("WB", "Ozon"):
+        if mp in rows_db:
+            kb.append([InlineKeyboardButton(text=f"📥 {mp}: отчёт за прошлую неделю", callback_data=f"api_fetch_{mp}")])
+        else:
+            kb.append([InlineKeyboardButton(text=f"➕ Подключить {mp}", callback_data=f"api_mp_{mp}")])
+    if rows_db:
+        on = any(r["auto_weekly"] for r in rows_db.values())
+        kb.append([InlineKeyboardButton(
+            text="🔕 Выключить автоотчёт" if on else "🔔 Включить автоотчёт по вторникам",
+            callback_data="api_auto_off" if on else "api_auto_on")])
+        kb.append([InlineKeyboardButton(text="❌ Отключить кабинет", callback_data="api_disconnect")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def _connect_text(user_id: int) -> str:
+    rows_db = _api_rows(user_id)
+    lines = ["🔌 <b>Кабинет по API</b>\n",
+             "Подключи кабинет один раз — и не нужно скачивать отчёты руками: "
+             "забираю детализацию WB и начисления Ozon сам."]
+    if rows_db:
+        lines.append("")
+        for mp, r in rows_db.items():
+            st = "✅ подключён"
+            if r.get("last_error"):
+                st = "⚠️ " + _html_escape(r["last_error"][:120])
+            lines.append(f"• <b>{mp}</b>: {st}")
+        auto = any(r["auto_weekly"] for r in rows_db.values())
+        if has_paid_access(user_id):
+            lines.append("\n🔔 Автоотчёт за прошлую неделю — по вторникам." if auto
+                         else "\n🔕 Автоотчёт выключен.")
+        else:
+            lines.append("\n🔔 Автоотчёт каждую неделю — по подписке (/buy).")
+    else:
+        lines.append("\nПо подписке отчёт будет приходить сам каждый вторник.")
+    return "\n".join(lines)
+
+
+async def _show_connect(user_id: int, username: str, target) -> None:
+    add_user(user_id, username or "")
+    if not MA.enabled():
+        await target.answer("🔌 Подключение кабинета по API скоро заработает. "
+                            "Пока пришли файл отчёта — разберу его за секунды.")
+        return
+    _event(user_id, "api_menu")
+    await target.answer(_connect_text(user_id), parse_mode="HTML",
+                        reply_markup=get_connect_keyboard(user_id))
+
+
+@dp.message(Command("connect"))
+@dp.message(F.text == "🔌 Кабинет по API")
+async def cmd_connect(message: Message):
+    await _show_connect(message.from_user.id, message.from_user.username, message)
+
+
+@dp.callback_query(F.data == "api_menu")
+async def callback_api_menu(callback: CallbackQuery):
+    await callback.answer()
+    await _show_connect(callback.from_user.id, callback.from_user.username, callback.message)
+
+
+@dp.callback_query(F.data.in_({"api_mp_WB", "api_mp_Ozon"}))
+async def callback_api_mp(callback: CallbackQuery):
+    await callback.answer()
+    mp = callback.data.split("_")[-1]
+    _api_state[callback.from_user.id] = mp
+    await callback.message.answer(WB_API_HOWTO if mp == "WB" else OZON_API_HOWTO, parse_mode="HTML")
+
+
+async def _handle_api_key(message: Message) -> None:
+    """Пользователь прислал токен/ключ после «Подключить WB/Ozon»."""
+    user_id = message.from_user.id
+    mp = _api_state.get(user_id)
+    text = (message.text or "").strip()
+    try:
+        await message.delete()          # не оставляем ключ в истории чата
+    except Exception:
+        pass
+    try:
+        if mp == "WB":
+            if not MA.looks_like_wb_token(text):
+                await message.answer("Это не похоже на токен WB — он длинный, из трёх частей через точку. "
+                                     "Скопируй его целиком и пришли ещё раз, или /cancel.")
+                return
+            info = await MA.wb_check(text)
+            if info.get("read_only") is False:
+                await message.answer("⚠️ Этот токен даёт право <b>изменять</b> данные в кабинете. "
+                                     "Для безопасности создай новый с галочкой «Только на чтение» и пришли его. "
+                                     "Этот токен лучше удалить в кабинете.", parse_mode="HTML")
+                return
+            creds = {"token": text}
+            exp = info["exp"].isoformat() if info.get("exp") else None
+        else:
+            parsed = MA.parse_ozon_credentials(text)
+            if not parsed:
+                await message.answer("Не вижу Client ID и API-ключ. Пришли их одним сообщением: "
+                                     "сначала Client ID (цифры), потом ключ. Или /cancel.")
+                return
+            client_id, api_key = parsed
+            info = await MA.ozon_check(client_id, api_key)
+            creds = {"client_id": client_id, "api_key": api_key}
+            exp = info.get("expires_at")
+    except MA.ApiError as exc:
+        await message.answer(f"❌ {exc}")
+        if exc.auth:
+            return
+        _api_state.pop(user_id, None)
+        return
+    except Exception:
+        logger.exception("Проверка API-ключа %s для %s", mp, user_id)
+        _api_state.pop(user_id, None)
+        await message.answer("❌ Не получилось связаться с маркетплейсом. Попробуй позже: /connect")
+        return
+
+    _api_state.pop(user_id, None)
+    save_api_token(user_id, mp, MA.encrypt(creds), exp)
+    _event(user_id, f"api_connect:{mp}")
+    await notify_admin(f"🔌 {_who(user_id)} подключил кабинет <b>{mp}</b> по API")
+    until = ""
+    if exp:
+        try:
+            until = f"\nКлюч действует до {datetime.fromisoformat(str(exp).replace('Z', '+00:00')):%d.%m.%Y}."
+        except ValueError:
+            pass
+    await message.answer(
+        f"✅ <b>{mp} подключён.</b> Сообщение с ключом удалено.{until}\n\n"
+        "Забрать отчёт за прошлую неделю прямо сейчас?",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text=f"📥 Отчёт {mp} за прошлую неделю", callback_data=f"api_fetch_{mp}")]]),
+    )
+
+
+async def _api_report(user_id: int, mp: str, target, auto: bool = False) -> bool:
+    """Забирает отчёт за прошлую неделю по API и присылает разбор. True — отчёт отправлен."""
+    row = get_api_token(user_id, mp)
+    if not row:
+        await target.answer(f"{mp} не подключён — /connect")
+        return False
+    start, end = MA.last_full_week()
+    processing = await target.answer(
+        ("📬 <b>Автоотчёт</b>\n" if auto else "")
+        + f"⏳ Забираю отчёт {mp} за {MA.period_text(start, end)} из кабинета…\n"
+        "Обычно это до минуты.", parse_mode="HTML")
+    path = None
+    try:
+        creds = MA.decrypt(row["secret"])
+        path = await MA.fetch_report_file(mp, creds, start, end)
+        await _process_report(target, user_id, path, f"{mp} API {MA.period_text(start, end)}.xlsx",
+                              processing, source="api")
+        update_api_token(user_id, mp, last_ok_at=datetime.utcnow().isoformat(timespec="seconds"),
+                         last_error="", last_sent_week=MA.week_key(start))
+        return True
+    except MA.NoData as exc:
+        await _safe_delete(processing)
+        if not auto:
+            await target.answer(f"📭 {exc}")
+        return False
+    except MA.ApiError as exc:
+        await _safe_delete(processing)
+        if exc.auth:
+            update_api_token(user_id, mp, last_error=str(exc)[:200], auto_weekly=0)
+        await target.answer(f"❌ {exc}")
+        return False
+    except Exception:
+        logger.exception("Отчёт по API %s для %s", mp, user_id)
+        await _safe_delete(processing)
+        await target.answer("❌ Не получилось разобрать отчёт из кабинета. Я уже посмотрю, в чём дело. "
+                            "А пока можно прислать файл отчёта вручную.")
+        await notify_admin(f"🚨 Ошибка отчёта по API {mp} у {_who(user_id)} — смотри логи")
+        return False
+    finally:
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+async def _safe_delete(msg) -> None:
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data.in_({"api_fetch_WB", "api_fetch_Ozon"}))
+async def callback_api_fetch(callback: CallbackQuery):
+    await callback.answer()
+    user_id = callback.from_user.id
+    if not is_trial_active(user_id):
+        _event(user_id, "paywall")
+        await callback.message.answer(trial_expired_text(), parse_mode="HTML", reply_markup=get_buy_keyboard())
+        return
+    await _api_report(user_id, callback.data.split("_")[-1], callback.message)
+
+
+@dp.callback_query(F.data.in_({"api_auto_on", "api_auto_off"}))
+async def callback_api_auto(callback: CallbackQuery):
+    await callback.answer()
+    user_id = callback.from_user.id
+    on = callback.data == "api_auto_on"
+    for mp in _api_rows(user_id):
+        update_api_token(user_id, mp, auto_weekly=1 if on else 0)
+    note = ""
+    if on and not has_paid_access(user_id):
+        note = "\n\nАвтоотчёт начнёт приходить, когда будет активна подписка → /buy"
+    await callback.message.answer(("🔔 Автоотчёт включён: по вторникам пришлю разбор прошлой недели."
+                                   if on else "🔕 Автоотчёт выключен.") + note)
+
+
+async def _disconnect(user_id: int, target) -> None:
+    n = delete_api_token(user_id)
+    _api_state.pop(user_id, None)
+    if n:
+        _event(user_id, "api_disconnect")
+    await target.answer("✅ Ключи удалены из бота. Для полной надёжности удали их и в кабинете маркетплейса."
+                        if n else "Кабинет по API не подключён.")
+
+
+@dp.message(Command("disconnect"))
+async def cmd_disconnect(message: Message):
+    await _disconnect(message.from_user.id, message)
+
+
+@dp.callback_query(F.data == "api_disconnect")
+async def callback_api_disconnect(callback: CallbackQuery):
+    await callback.answer()
+    await _disconnect(callback.from_user.id, callback.message)
+
+
+async def run_auto_reports(now: datetime | None = None) -> int:
+    """Один проход автоотчётов. Возвращает, сколько отчётов отправлено."""
+    now = (now or _now_msk()).astimezone(MSK)
+    if now.weekday() not in AUTO_REPORT_WEEKDAYS or not (AUTO_REPORT_HOURS[0] <= now.hour < AUTO_REPORT_HOURS[1]):
+        return 0
+    start, _ = MA.last_full_week(now.date())
+    wk = MA.week_key(start)
+    sent = 0
+    for row in list_api_tokens():
+        uid, mp = row["user_id"], row["marketplace"]
+        if not row["auto_weekly"] or row["last_sent_week"] == wk:
+            continue
+        key = (uid, mp, wk, now.date().isoformat())
+        if key in _auto_attempts or not has_paid_access(uid):
+            continue
+        _auto_attempts.add(key)
+        try:
+            if await _api_report(uid, mp, _ChatTarget(uid), auto=True):
+                sent += 1
+        except Exception:
+            logger.exception("Автоотчёт %s для %s", mp, uid)
+        await asyncio.sleep(2)
+    return sent
+
+
+async def _auto_report_loop() -> None:
+    while True:
+        try:
+            await run_auto_reports()
+        except Exception:
+            logger.exception("Цикл автоотчётов упал")
+        await asyncio.sleep(30 * 60)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # /compare — СРАВНЕНИЕ ДВУХ ОТЧЁТОВ
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1809,8 +2367,8 @@ async def cmd_compare(message: Message):
     """Запускает режим сравнения: ждём два файла (старый, затем новый)."""
     user_id = message.from_user.id
     add_user(user_id, message.from_user.username or "")
-    if not is_trial_active(user_id):
-        await message.answer(trial_expired_text(), parse_mode="HTML", reply_markup=get_buy_keyboard())
+    if not has_paid_access(user_id):
+        await message.answer(paid_only_text(), parse_mode="HTML", reply_markup=get_buy_keyboard())
         return
     _compare_state[user_id] = {"old": None, "old_name": ""}
     await message.answer(
@@ -1830,8 +2388,8 @@ async def cmd_wbozon(message: Message):
     """Сравнение площадок: где с рубля выручки остаётся больше."""
     user_id = message.from_user.id
     add_user(user_id, message.from_user.username or "")
-    if not is_trial_active(user_id):
-        await message.answer(trial_expired_text(), parse_mode="HTML", reply_markup=get_buy_keyboard())
+    if not has_paid_access(user_id):
+        await message.answer(paid_only_text(), parse_mode="HTML", reply_markup=get_buy_keyboard())
         return
     _compare_state[user_id] = {"cross": True, "reports": {}, "old": None, "old_name": ""}
     await message.answer(
@@ -2658,6 +3216,9 @@ async def cmd_cancel(message: Message):
     if user_id in _cost_state:
         _cost_state.pop(user_id, None)
         cancelled = True
+    if user_id in _api_state:
+        _api_state.pop(user_id, None)
+        cancelled = True
     if cancelled:
         await message.answer("🚫 Действие отменено. Отправьте новый отчёт в любой момент.")
     else:
@@ -2672,6 +3233,11 @@ async def cmd_cancel(message: Message):
 async def handle_other(message: Message):
     """Обработчик любых других сообщений (текст, фото)."""
     user_id = message.from_user.id
+
+    # ── Ждём API-ключ маркетплейса (/connect) ──────────────────────
+    if user_id in _api_state and isinstance(message.text, str):
+        await _handle_api_key(message)
+        return
 
     # ── Если ждём жалобу от этого пользователя ──────────────────────
     if user_id in _pending_problem:
@@ -2713,7 +3279,7 @@ async def handle_other(message: Message):
 
         await message.answer(
             "✅ Спасибо! Жалоба отправлена разработчику.\n"
-            "Он получит ваше описание и файл отчёта для разбора.\n\n"
+            "Если для разбора понадобится сам файл — он попросит прислать его отдельно.\n\n"
             "Можете продолжать пользоваться ботом.",
         )
         logger.info("Жалоба от %s по файлу %s: %s", user_id, file_name, (message.text or "")[:100])
@@ -2805,6 +3371,11 @@ async def main():
     logger.info("ADMIN_ID: %s", ADMIN_ID)
     if ym.enabled():
         asyncio.create_task(_yoomoney_poller())
+    if MA.enabled():
+        asyncio.create_task(_auto_report_loop())
+        logger.info("Кабинет по API: включён, автоотчёт по дням %s", AUTO_REPORT_WEEKDAYS)
+    else:
+        logger.info("Кабинет по API выключен (API_ENC_KEY не задан)")
     try:
         await legal.ensure_published()
     except Exception as exc:

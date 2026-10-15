@@ -7,7 +7,7 @@ legal.py — публичная оферта и политика обработ�
     SELLER_INN    — ИНН (12 цифр)
     SELLER_EMAIL  — e-mail для претензий и запросов по персональным данным
     BOT_USERNAME  — @имя бота (по умолчанию @wildfinance_bot)
-    LEGAL_DATE    — дата редакции документов (по умолчанию 01.10.2026)
+    LEGAL_DATE    — дата редакции документов (по умолчанию 15.10.2026)
 
 Публикация: при старте бот сам выкладывает документы на telegra.ph
 (без регистрации) и запоминает ссылки в DATA_DIR/legal_pages.json.
@@ -50,7 +50,7 @@ def seller() -> dict:
         "seller_inn": os.getenv("SELLER_INN", "").strip(),
         "seller_email": os.getenv("SELLER_EMAIL", "").strip(),
         "bot_username": os.getenv("BOT_USERNAME", "@wildfinance_bot").strip() or "@wildfinance_bot",
-        "doc_date": os.getenv("LEGAL_DATE", "01.10.2026").strip() or "01.10.2026",
+        "doc_date": os.getenv("LEGAL_DATE", "15.10.2026").strip() or "15.10.2026",
     }
 
 
