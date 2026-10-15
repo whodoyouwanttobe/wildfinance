@@ -56,6 +56,8 @@ from database import (
     free_reports_left,
     use_free_report,
     has_event,
+    get_user_events,
+    find_user_id,
     save_api_token,
     get_api_token,
     list_api_tokens,
@@ -332,17 +334,49 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 
+def _action_label(event) -> str:
+    """Короткое имя действия для журнала. Свободный текст НЕ пишем (там могут быть ключи и личное)."""
+    data = getattr(event, "data", None)
+    if isinstance(data, str):
+        return "btn:" + data[:40]
+    if getattr(event, "document", None) is not None:
+        return "file"
+    text = getattr(event, "text", None)
+    if isinstance(text, str):
+        if text.startswith("/"):
+            return "cmd:" + text.split()[0][:30]
+        if text in MENU_BUTTONS:
+            return "menu:" + text[:40]
+        return "text"
+    return "other"
+
+
+MENU_BUTTONS = {
+    "📊 Получить пример отчёта", "📈 Моя статистика", "⚖️ WB против Ozon", "💳 Оплатить доступ",
+    "🎁 Пригласить друга", "📄 Помощь", "🔌 Кабинет по API", "🤖 AI-разбор",
+}
+
+# Кому выдан доступ и кого ждём: {user_id: что выдали} — уведомим админа о первой активности
+_watch_after_grant: dict[int, str] = {}
+
+
 async def _activity_middleware(handler, event, data):
-    """После любого сообщения или кнопки отмечаем активность: когда заходил и как часто."""
+    """После любого сообщения или кнопки отмечаем активность и пишем действие в журнал."""
     try:
         return await handler(event, data)
     finally:
         user = getattr(event, "from_user", None)
-        if user is not None:
+        if user is not None and user.id != ADMIN_ID:
+            label = _action_label(event)
             try:
                 await asyncio.to_thread(touch_user, user.id, user.username)
+                await asyncio.to_thread(log_event, user.id, "act:" + label)
             except Exception:
                 logger.exception("Не удалось отметить активность %s", getattr(user, "id", "?"))
+            what = _watch_after_grant.pop(user.id, None)
+            if what and label != "btn:access_ack":       # нажатие кнопки и так придёт уведомлением
+                await notify_admin(f"👀 {_who(user.id, user.username)} открыл бота после того, как получил {what}. "
+                                   f"Действие: <code>{_html_escape(label)}</code>")
 
 
 dp.message.outer_middleware(_activity_middleware)
@@ -361,6 +395,8 @@ WELCOME_TEXT = (
     "  🔤 ABC-анализ ассортимента\n"
     "  💡 Рекомендации по оптимизации\n\n"
     "🔒 Доступ к кабинету не нужен. Файл удаляется сразу после разбора.\n\n"
+    "🔌 <b>Не хочешь скачивать отчёты?</b> Подключи кабинет WB или Ozon ключом «только на чтение» "
+    "(кнопка «🔌 Кабинет по API» или /connect) — заберу отчёт сам.\n\n"
     "💡 <b>Хочешь сначала посмотреть, как это работает?</b>\n"
     "Нажми кнопку <b>«📊 Получить пример отчёта»</b> внизу —\n"
     "сразу пришлю разбор реалистичного отчёта.\n\n"
@@ -396,7 +432,8 @@ HELP_TEXT = (
     "1️⃣ Скачай детализированный отчёт:\n"
     "   • <b>Wildberries</b>: Личный кабинет → Финансы → Детализация\n"
     "   • <b>Ozon</b>: Финансы → Детализация начислений → выгрузи CSV/XLSX\n\n"
-    "2️⃣ Пришли файл (.xlsx или .csv) в этот чат\n\n"
+    "2️⃣ Пришли файл (.xlsx или .csv) в этот чат\n"
+    "   …или подключи кабинет по API (/connect) — тогда скачивать ничего не нужно\n\n"
     "3️⃣ Получи полный анализ за секунды:\n"
     "   • Чистая прибыль по каждому артикулу\n"
     "   • Скрытые расходы и штрафы\n"
@@ -611,12 +648,31 @@ def get_post_report_keyboard(has_fines: bool = False, offer_api: bool = False) -
 # ХЕНДЛЕРЫ КОМАНД
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# Важные шаги воронки — админу приходит уведомление (один раз на человека и шаг)
+HOT_EVENTS = {
+    "demo": "👀 открыл пример отчёта",
+    "buy_open": "💳 смотрит тарифы",
+    "buy_click": "💳 нажал «Оплатить»",
+    "paywall": "⛔ упёрся в оплату (бесплатный разбор использован)",
+    "api_menu": "🔌 открыл подключение кабинета",
+    "access_ack": "✅ прочитал сообщение о выданном доступе",
+}
+NOTIFY_ACTIVITY = os.getenv("NOTIFY_ACTIVITY", "1") == "1"
+
+
 def _event(user_id: int, event: str) -> None:
     """Событие воронки для CRM. Ошибки не должны мешать работе бота."""
+    first = False
     try:
+        first = event in HOT_EVENTS and not has_event(user_id, event)
         log_event(user_id, event)
     except Exception:
         logger.exception("Не удалось записать событие %s для %s", event, user_id)
+    if first and NOTIFY_ACTIVITY and user_id != ADMIN_ID:
+        try:
+            asyncio.get_running_loop().create_task(notify_admin(f"{_who(user_id)} {HOT_EVENTS[event]}"))
+        except RuntimeError:
+            pass
 
 
 async def notify_admin(text: str) -> None:
@@ -1600,16 +1656,25 @@ async def cmd_give_access(message: Message):
             f"выдан на <b>{days} дн.</b>",
             parse_mode="HTML",
         )
-        # Уведомляем пользователя
+        # Уведомляем пользователя. Telegram не сообщает ботам, прочитано ли сообщение,
+        # поэтому даём кнопку: нажатие = прочитал. Плюс ждём любую его активность.
+        _event(target_user_id, "access_granted")
+        _watch_after_grant[target_user_id] = f"доступ на {days} дн."
         try:
             await bot.send_message(
                 target_user_id,
-                f"🎉 Вам выдан доступ на <b>{days} дн.</b>\n"
-                f"Отправьте отчёт для анализа!",
+                f"🎉 Вам выдан доступ на <b>{days} дн.</b>\n\n"
+                "Пришлите детализацию WB или отчёт Ozon по начислениям — разбор придёт за полминуты.",
                 parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="👍 Спасибо, пришлю отчёт", callback_data="access_ack")],
+                    [InlineKeyboardButton(text="❓ Где скачать отчёт", callback_data="access_howto")],
+                ]),
             )
+            await message.answer("📨 Сообщение отправлено. Когда человек нажмёт кнопку или что-то сделает в боте — "
+                                 "пришлю уведомление. Вся активность: /user " + str(target_user_id))
         except Exception:
-            pass
+            await message.answer("⚠️ Не удалось отправить сообщение — возможно, человек заблокировал бота.")
         logger.info("Админ выдал доступ: user=%s, days=%s", target_user_id, days)
     else:
         await message.answer(
@@ -1617,6 +1682,16 @@ async def cmd_give_access(message: Message):
             f"Он должен сначала написать боту /start.",
             parse_mode="HTML",
         )
+
+
+@dp.callback_query(F.data.in_({"access_ack", "access_howto"}))
+async def callback_access_ack(callback: CallbackQuery):
+    await callback.answer()
+    _event(callback.from_user.id, "access_ack")
+    if callback.data == "access_howto":
+        await callback.message.answer(HELP_TEXT, parse_mode="HTML")
+    else:
+        await callback.message.answer("Отлично! Жду файл отчёта 🙌 Если что-то не получится — просто напишите сюда.")
 
 
 @dp.message(Command("sources"))
@@ -1749,8 +1824,49 @@ def _user_card(u: dict) -> str:
     if u.get("access_until"):
         lines.append(f"   💎 Доступ до: {u['access_until'][:10]}")
     else:
-        lines.append("   🆓 Триал")
+        lines.append("   🆓 Бесплатный разбор " + ("использован" if u.get("free_used") else "не использован"))
+    if ev.get("access_granted"):
+        lines.append("   📨 Доступ выдан → " + ("✅ прочитал (нажал кнопку)" if ev.get("access_ack") else "кнопку не нажимал"))
+    lines.append(f"   🔎 Подробно: /user {u['user_id']}")
     return "\n".join(lines)
+
+
+EVENT_NAMES = {
+    "start": "запустил бота", "demo": "открыл пример", "demo_reupload": "прислал файл-пример",
+    "buy_open": "открыл тарифы", "buy_click": "нажал «Оплатить»", "paid": "💰 оплатил",
+    "paywall": "⛔ упёрся в оплату", "fines": "открыл штрафы", "fines_appeal": "текст обращения",
+    "api_menu": "открыл «Кабинет по API»", "access_granted": "📨 выдан доступ",
+    "access_ack": "✅ прочитал сообщение о доступе",
+}
+
+
+def _event_text(ev: str) -> str:
+    if ev in EVENT_NAMES:
+        return EVENT_NAMES[ev]
+    if ev.startswith("start:"):
+        return f"запустил по ссылке {_html_escape(ev[6:])}"
+    if ev.startswith("report"):
+        return "📊 отчёт " + _html_escape(ev.split(":", 1)[-1]) + (" (API)" if ev.startswith("report_api") else "")
+    if ev.startswith("act:"):
+        return "· " + _html_escape(ev[4:])
+    return _html_escape(ev)
+
+
+@dp.message(Command("user"))
+async def cmd_user(message: Message):
+    """Админ: /user <id или @username> — карточка и лента действий."""
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    uid = find_user_id(parts[1]) if len(parts) > 1 else None
+    row = next((u for u in get_crm_rows() if u["user_id"] == uid), None) if uid else None
+    if not row:
+        await message.answer("Формат: /user 123456 или /user @username")
+        return
+    lines = [_user_card(row), "", "<b>Лента (МСК, новые сверху):</b>"]
+    for ev, ts in get_user_events(uid, 40):
+        lines.append(f"{_msk(ts)} — {_event_text(ev)}")
+    await message.answer("\n".join(lines)[:4000], parse_mode="HTML")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

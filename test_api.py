@@ -364,3 +364,38 @@ def test_year_price_is_eight_months():
     assert B.year_savings() == (3560, 33)
     text = B.plan_button_text("year")
     assert "7 120" in text and "−33%" in text and "3 560" in text
+
+
+# ─── Прочитал ли человек сообщение о доступе, лента активности ─────────────
+
+@pytest.mark.asyncio
+async def test_give_access_ack_and_timeline(api_db, monkeypatch):
+    monkeypatch.setattr(B, "ADMIN_ID", 555)
+    monkeypatch.setattr(B, "grant_access", lambda uid, d: database.grant_access(uid, d, db_path=api_db))
+    monkeypatch.setattr(B, "get_crm_rows", lambda: database.get_crm_rows(api_db))
+    monkeypatch.setattr(B, "get_user_events", lambda *a: database.get_user_events(*a, db_path=api_db))
+    monkeypatch.setattr(B, "find_user_id", lambda q: database.find_user_id(q, db_path=api_db))
+    monkeypatch.setattr(B, "log_event", lambda *a: database.log_event(*a, db_path=api_db))
+    sent = AsyncMock()
+    monkeypatch.setattr(B.bot, "send_message", sent, raising=False)
+    database.add_user(920, "snezh", db_path=api_db)
+    admin = _msg(555, text="/give_access 920 30")
+    await B.cmd_give_access(admin)
+    user_msg = next(c for c in sent.call_args_list if c.args[0] == 920)
+    datas = [b.callback_data for r in user_msg.kwargs["reply_markup"].inline_keyboard for b in r]
+    assert datas == ["access_ack", "access_howto"] and 920 in B._watch_after_grant
+    sent.reset_mock()
+    await B.callback_access_ack(_cb(920, "access_ack"))
+    import asyncio
+    await asyncio.sleep(0)
+    assert any("прочитал сообщение" in c.args[1] for c in sent.call_args_list if c.args[0] == 555)
+    m = _msg(555, text="/user @snezh")
+    await B.cmd_user(m)
+    out = m.answer.call_args.args[0]
+    assert "✅ прочитал" in out and "выдан доступ" in out
+
+
+def test_action_label_never_logs_free_text():
+    assert B._action_label(SimpleNamespace(data="api_fetch_WB")) == "btn:api_fetch_WB"
+    assert B._action_label(SimpleNamespace(data=None, document=None, text="/buy now")) == "cmd:/buy"
+    assert B._action_label(SimpleNamespace(data=None, document=None, text="мой токен eyJ...")) == "text"

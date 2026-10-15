@@ -896,3 +896,28 @@ def has_event(user_id: int, event: str, db_path: str | None = None) -> bool:
         ).fetchone() is not None
     finally:
         conn.close()
+
+
+def get_user_events(user_id: int, limit: int = 30, db_path: str | None = None) -> list[tuple[str, str]]:
+    """Последние события пользователя (новые сверху): [(event, created_at)]."""
+    conn = get_connection(db_path or DB_PATH)
+    try:
+        return conn.execute(
+            "SELECT event, created_at FROM user_events WHERE user_id = ? ORDER BY rowid DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def find_user_id(query: str, db_path: str | None = None) -> int | None:
+    """ID по «123», «@name» или «name»."""
+    q = (query or "").strip().lstrip("@")
+    if q.isdigit():
+        return int(q)
+    conn = get_connection(db_path or DB_PATH)
+    try:
+        row = conn.execute("SELECT user_id FROM users WHERE lower(username) = lower(?)", (q,)).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
