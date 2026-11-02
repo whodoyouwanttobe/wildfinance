@@ -330,7 +330,11 @@ if not BOT_TOKEN:
         "  export BOT_TOKEN=123456:ABC-DEF  (Linux/Mac)"
     )
 
-bot = Bot(token=BOT_TOKEN)
+# TELEGRAM_PROXY=http://user:pass@host:port — если хостинг не пропускает к api.telegram.org
+TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY", "")
+if TELEGRAM_PROXY:
+    from aiogram.client.session.aiohttp import AiohttpSession
+bot = Bot(token=BOT_TOKEN, session=AiohttpSession(proxy=TELEGRAM_PROXY) if TELEGRAM_PROXY else None)
 dp = Dispatcher()
 
 
