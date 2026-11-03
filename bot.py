@@ -100,6 +100,8 @@ import history as H
 import fines as FN
 import mp_api as MA
 import crm
+import reviews
+from html import escape as _esc
 from wb_parser import analyze as wb_analyze
 from ozon_parser import analyze as ozon_analyze
 from parser_dispatcher import analyze, analyze_full, detect_marketplace, compute
@@ -1686,6 +1688,45 @@ async def cmd_give_access(message: Message):
             f"Он должен сначала написать боту /start.",
             parse_mode="HTML",
         )
+
+
+# ─── Отзывы с сайта: модерация кнопками ─────────────────────────────────────
+def _review_kb(rid: int, published: bool) -> InlineKeyboardMarkup:
+    if published:
+        return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🗑 Снять с сайта", callback_data=f"rev_no:{rid}")]])
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"rev_ok:{rid}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"rev_no:{rid}"),
+    ]])
+
+
+async def _notify_review(r: dict) -> None:
+    if not ADMIN_ID:
+        return
+    who = ", ".join(x for x in (r.get("role"), r.get("company")) if x)
+    text = (f"📝 <b>Новый отзыв на сайте</b> №{r['id']}\n"
+            f"<b>{_esc(r['name'])}</b>{' · ' + _esc(who) if who else ''}\n"
+            f"О чём: {_esc(r.get('solution') or 'о компании')}\n\n{_esc(r['text'])}")
+    await bot.send_message(ADMIN_ID, text, parse_mode="HTML", reply_markup=_review_kb(r["id"], False))
+
+reviews.on_new = _notify_review
+
+
+@dp.callback_query(F.data.regexp(r"^rev_(ok|no):\d+$"))
+async def callback_review(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer()
+        return
+    action, rid = callback.data[4:].split(":")
+    r = reviews.set_status(int(rid), "approved" if action == "ok" else "rejected")
+    if not r:
+        await callback.answer("Отзыв не найден", show_alert=True)
+        return
+    published = r["status"] == "approved"
+    await callback.answer("Опубликован на сайте" if published else "Скрыт с сайта")
+    mark = "✅ Опубликован" if published else "❌ Не публикуется"
+    body = (callback.message.html_text or "").split("\n\n— ")[0]
+    await callback.message.edit_text(f"{body}\n\n— {mark}", parse_mode="HTML", reply_markup=_review_kb(r["id"], published))
 
 
 @dp.callback_query(F.data.in_({"access_ack", "access_howto"}))

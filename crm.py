@@ -48,13 +48,14 @@ def build_payload(db_path: str | None = None) -> dict:
         "bot": os.getenv("BOT_USERNAME", "@wildfinance_bot").lstrip("@"),
         "admin_id": int(os.getenv("ADMIN_ID", "0") or 0),
         "users": rows,
+        "outreach": database.get_outreach(db_path or database.DB_PATH),
     }
 
 
 CORS = {
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "Authorization",
-    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
 }
 
 
@@ -72,9 +73,27 @@ async def start_server() -> None:
             return web.json_response({"error": "unauthorized"}, status=401, headers=CORS)
         return web.json_response(build_payload(), headers=CORS)
 
+    async def handle_outreach(request: "web.Request") -> "web.Response":
+        """POST /crm/outreach {recipient, kind?, text?, sent_at?} — TeleBridge сообщает, что вы кому-то написали."""
+        if request.method == "OPTIONS":
+            return web.Response(headers=CORS)
+        if not authorized(request.headers.get("Authorization"), request.query.get("token")):
+            return web.json_response({"error": "unauthorized"}, status=401, headers=CORS)
+        try:
+            body = await request.json()
+            database.add_outreach(str(body.get("recipient", "")), str(body.get("kind", "")),
+                                  str(body.get("text", "")), body.get("sent_at"))
+        except (ValueError, TypeError, AttributeError) as exc:
+            return web.json_response({"error": str(exc) or "bad request"}, status=400, headers=CORS)
+        return web.json_response({"ok": True}, headers=CORS)
+
     app = web.Application()
     app.router.add_route("GET", "/crm", handle)
     app.router.add_route("OPTIONS", "/crm", handle)
+    app.router.add_route("POST", "/crm/outreach", handle_outreach)
+    app.router.add_route("OPTIONS", "/crm/outreach", handle_outreach)
+    import reviews
+    reviews.setup(app)                       # отзывы с сайта: POST /review, GET /reviews
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.getenv("CRM_PORT", "8088"))
