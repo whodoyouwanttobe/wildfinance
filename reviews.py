@@ -26,6 +26,13 @@ logger = logging.getLogger(__name__)
 # bot.py подставляет сюда отправку админу: async def(review: dict) -> None
 on_new: Callable[[dict], Awaitable[None]] | None = None
 
+# Как подписать отзыв на сайте. Админу в Telegram всегда приходит всё, что человек указал.
+SIGN = {
+    "full": "имя, должность и компания",
+    "no_company": "без названия компании",
+    "anon": "анонимно (только должность)",
+}
+
 LIMITS = {"name": 80, "role": 120, "company": 120, "solution": 60, "text": 1500}
 MIN_TEXT = 20
 PER_HOUR = 3
@@ -54,6 +61,11 @@ def _conn(db_path: str | None = None):
             decided_at TEXT DEFAULT NULL
         )
     """)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(site_reviews)")}
+    if "sign" not in cols:
+        conn.execute("ALTER TABLE site_reviews ADD COLUMN sign TEXT NOT NULL DEFAULT 'full'")
+    if "stars" not in cols:
+        conn.execute("ALTER TABLE site_reviews ADD COLUMN stars INTEGER NOT NULL DEFAULT 0")
     return conn
 
 
@@ -70,6 +82,13 @@ def validate(body: dict) -> dict:
         raise ValueError("Укажите имя")
     if len(clean["text"]) < MIN_TEXT:
         raise ValueError(f"Напишите хотя бы пару предложений (от {MIN_TEXT} символов)")
+    clean["sign"] = body.get("sign") if body.get("sign") in SIGN else "full"
+    try:
+        clean["stars"] = int(body.get("stars"))
+    except (TypeError, ValueError):
+        clean["stars"] = 0
+    if not 1 <= clean["stars"] <= 5:
+        raise ValueError("Поставьте оценку от 1 до 5 звёзд")
     if body.get("consent") is not True:
         raise ValueError("Нужно согласие на публикацию отзыва")
     return clean
@@ -91,8 +110,8 @@ def add(r: dict, ip: str = "", db_path: str | None = None) -> int:
     conn = _conn(db_path)
     try:
         cur = conn.execute(
-            "INSERT INTO site_reviews (name, role, company, solution, text, ip, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (r["name"], r["role"], r["company"], r["solution"], r["text"], ip[:45],
+            "INSERT INTO site_reviews (name, role, company, solution, text, sign, stars, ip, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (r["name"], r["role"], r["company"], r["solution"], r["text"], r.get("sign", "full"), int(r.get("stars", 0)), ip[:45],
              datetime.utcnow().isoformat(timespec="seconds")),
         )
         conn.commit()
@@ -116,15 +135,25 @@ def set_status(review_id: int, status: str, db_path: str | None = None) -> dict 
     return dict(zip(keys, row)) if row else None
 
 
+def public(r: dict) -> dict:
+    """Что видно на сайте: скрытое по просьбе клиента наружу не отдаём."""
+    out = {k: r[k] for k in ("id", "name", "role", "company", "solution", "text", "date", "stars")}
+    if r["sign"] in ("no_company", "anon"):
+        out["company"] = ""
+    if r["sign"] == "anon":
+        out["name"] = "Имя и компания скрыты по просьбе клиента"
+    return out
+
+
 def approved(db_path: str | None = None) -> list[dict]:
     conn = _conn(db_path)
     try:
-        rows = conn.execute("SELECT id, name, role, company, solution, text, created_at FROM site_reviews "
+        rows = conn.execute("SELECT id, name, role, company, solution, text, created_at, sign, stars FROM site_reviews "
                             "WHERE status = 'approved' ORDER BY created_at DESC LIMIT 100").fetchall()
     finally:
         conn.close()
-    keys = ("id", "name", "role", "company", "solution", "text", "date")
-    return [dict(zip(keys, r)) | {"date": r[6][:10]} for r in rows]
+    keys = ("id", "name", "role", "company", "solution", "text", "date", "sign", "stars")
+    return [public(dict(zip(keys, r)) | {"date": r[6][:10]}) for r in rows]
 
 
 def client_ip(request) -> str:

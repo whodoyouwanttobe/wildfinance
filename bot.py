@@ -1704,9 +1704,11 @@ async def _notify_review(r: dict) -> None:
     if not ADMIN_ID:
         return
     who = ", ".join(x for x in (r.get("role"), r.get("company")) if x)
-    text = (f"📝 <b>Новый отзыв на сайте</b> №{r['id']}\n"
+    stars = int(r.get("stars") or 0)
+    text = (f"📝 <b>Новый отзыв на сайте</b> №{r['id']}  {'★' * stars}{'☆' * (5 - stars)}\n"
             f"<b>{_esc(r['name'])}</b>{' · ' + _esc(who) if who else ''}\n"
-            f"О чём: {_esc(r.get('solution') or 'о компании')}\n\n{_esc(r['text'])}")
+            f"О чём: {_esc(r.get('solution') or 'о компании')}\n"
+            f"Подпись на сайте: {reviews.SIGN.get(r.get('sign', 'full'))}\n\n{_esc(r['text'])}")
     await bot.send_message(ADMIN_ID, text, parse_mode="HTML", reply_markup=_review_kb(r["id"], False))
 
 reviews.on_new = _notify_review

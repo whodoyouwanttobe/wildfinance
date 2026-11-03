@@ -7,7 +7,7 @@ import reviews
 
 def form(**kw):
     base = {"name": "Иван", "role": "ГИП", "company": "ООО Проект", "solution": "wpm",
-            "text": "Печать комплекта теперь занимает десять минут.", "consent": True}
+            "text": "Печать комплекта теперь занимает десять минут.", "consent": True, "stars": 5}
     return base | kw
 
 
@@ -16,7 +16,8 @@ def test_validate_ok():
     assert r["name"] == "Иван" and r["solution"] == "wpmscript"
 
 
-@pytest.mark.parametrize("bad", [form(name=""), form(text="коротко"), form(consent=False), "строка"])
+@pytest.mark.parametrize("bad", [form(name=""), form(text="коротко"), form(consent=False), "строка",
+                                 form(stars=0), form(stars=6), form(stars="пять"), form(stars=None)])
 def test_validate_errors(bad):
     with pytest.raises(ValueError):
         reviews.validate(bad)
@@ -45,3 +46,24 @@ def test_moderation(tmp_path):
     reviews.set_status(rid, "rejected", db_path=p)
     assert reviews.approved(p) == []
     assert reviews.set_status(999, "approved", db_path=p) is None
+
+
+def test_anonymous(tmp_path):
+    p = str(tmp_path / "a.db")
+    a = reviews.add(reviews.validate(form(sign="no_company")), db_path=p)
+    b = reviews.add(reviews.validate(form(sign="anon", name="Пётр")), db_path=p)
+    c = reviews.add(reviews.validate(form(sign="что-то странное")), db_path=p)
+    for rid in (a, b, c):
+        reviews.set_status(rid, "approved", db_path=p)
+    pub = {r["id"]: r for r in reviews.approved(p)}
+    assert pub[a]["company"] == "" and pub[a]["name"] == "Иван"
+    assert pub[b]["company"] == "" and "Пётр" not in pub[b]["name"] and pub[b]["role"] == "ГИП"
+    assert pub[c]["company"] == "ООО Проект"              # неизвестный вариант → подпись полностью
+    assert all("sign" not in r for r in pub.values())
+
+
+def test_stars(tmp_path):
+    p = str(tmp_path / "s.db")
+    rid = reviews.add(reviews.validate(form(stars="4")), db_path=p)
+    reviews.set_status(rid, "approved", db_path=p)
+    assert reviews.approved(p)[0]["stars"] == 4
